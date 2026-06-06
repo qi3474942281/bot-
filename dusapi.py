@@ -48,7 +48,9 @@ class DusAPI:
         messages = []
         if history:
             for h in history:
-                role = "assistant" if h.get('attr') == 'self' else "user"
+                role = h.get("role")
+                if role not in {"user", "assistant"}:
+                    role = "assistant" if h.get('attr') == 'self' else "user"
                 t = h.get('time', '')
                 content = f"[{t}] {h.get('content', '')}" if t else h.get('content', '')
                 messages.append({"role": role, "content": content})

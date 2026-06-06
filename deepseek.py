@@ -43,7 +43,9 @@ class DeepSeekAPI:
         messages = [{"role": "system", "content": prompt}]
         if history:
             for h in history:
-                role = "assistant" if h.get("attr") == "self" else "user"
+                role = h.get("role")
+                if role not in {"user", "assistant"}:
+                    role = "assistant" if h.get("attr") == "self" else "user"
                 text = h.get("content", "")
                 t = h.get("time", "")
                 content = f"[{t}] {text}" if t else text

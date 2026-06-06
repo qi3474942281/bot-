@@ -13,7 +13,11 @@ jobs:
         with:
           python-version: "3.12"
       - name: Validate Python syntax
-        run: python -m py_compile bot.py deepseek.py dusapi.py sync_from_github.py
+        run: python -m py_compile bot.py deepseek.py dusapi.py sync_from_github.py clawbot_backend.py
+      - name: Run backend tests
+        run: |
+          pip install -r requirements.txt
+          python -m unittest discover -s tests
       - name: Validate public settings
         run: |
           python - <<'PY'

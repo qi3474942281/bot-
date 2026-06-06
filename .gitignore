@@ -10,4 +10,9 @@ wechat-clawbot-qrcode.png
 *.zip
 .env
 .env.*
-
+backend_config.json
+clawbot-data.sqlite3
+clawbot-data.sqlite3-*
+tests/tmp*/
+tests/backend-test.sqlite3*
+.test-pycache/

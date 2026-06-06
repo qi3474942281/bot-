@@ -14,9 +14,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dusapi import DusAPI, DusConfig
 from deepseek import DeepSeekAPI, DeepSeekConfig
 from sync_from_github import sync_public_settings
+from clawbot_backend import ClawBotStore, start_backend
 
 executor = ThreadPoolExecutor(max_workers=4)
 ai = None  # 启动时从配置文件加载后初始化
+clawbot_store = ClawBotStore()
 
 # ========== 自动重连配置（可调参数） ==========
 # 测试时将数值改小，例如：
@@ -687,6 +689,7 @@ async def login_with_qrcode(session, base_url=BASE_URL):
 
 
 async def main():
+    await start_backend(clawbot_store)
     async with aiohttp.ClientSession() as session:
         # 1. 获取二维码并等待扫码
         login_result = await login_with_qrcode(session)
@@ -754,10 +757,21 @@ async def main():
                 loop = asyncio.get_event_loop()
                 # 或者替换为你自已要用的接口
                 active_model = get_active_model_name()
+                active_prompt = clawbot_store.build_prompt(_raw_cfg["prompt"])
+                recent_history = clawbot_store.recent_history(from_id)
                 reply = await loop.run_in_executor(
                     executor,
-                    partial(ai.chat, text, model=active_model),
+                    partial(
+                        ai.chat,
+                        text,
+                        model=active_model,
+                        prompt=active_prompt,
+                        history=recent_history,
+                    ),
                 )
+                if reply:
+                    clawbot_store.add_message(from_id, "user", text)
+                    clawbot_store.add_message(from_id, "assistant", reply)
 
                 # sendmessage（补全 SDK 所需字段）
                 client_id = f"openclaw-weixin-{random.randint(0, 0xFFFFFFFF):08x}"

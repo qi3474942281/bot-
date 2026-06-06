@@ -321,3 +321,13 @@ https://qi3474942281.github.io/bot-/
 
 运行 `sync-and-start.cmd` 会先同步公开设置，再启动机器人。`config.json`
 始终只保存在运行机器上，其中的 API Key 和接口地址不会上传。
+
+## 人设与记忆后端
+
+`bot.py` 启动时会同时启动 `http://127.0.0.1:8765` 后端，并在首次运行时
+创建 `backend_config.json`。该文件包含网页管理令牌，不能提交到 GitHub。
+
+运行 `start-cloudflare-tunnel.cmd` 后，将终端显示的
+`https://*.trycloudflare.com` 地址和 `backend_config.json` 中的令牌填入
+GitHub Pages 首页。页面保存的人设和记忆会写入云电脑的
+`clawbot-data.sqlite3`，Bot 对话也会自动记录到该数据库。
