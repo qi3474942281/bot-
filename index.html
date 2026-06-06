@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clawbot 人设编辑器</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; }
+        .tab {
+            padding: 10px 24px;
+            font-weight: 500;
+            color: #64748b;
+            cursor: pointer;
+            border-bottom: 3px solid transparent;
+            transition: all 0.2s;
+        }
+        .tab.active {
+            color: #0f172a;
+            border-bottom-color: #0f172a;
+            font-weight: 600;
+        }
+        .content { display: none; }
+        .content.active { display: block; }
+        .memory-item {
+            transition: background 0.1s;
+        }
+        .memory-item:hover {
+            background: #f8fafc;
+        }
+        .character-item {
+            transition: all 0.1s;
+        }
+        .character-item.active {
+            background: #f1f5f9;
+            font-weight: 600;
+        }
+        .character-item:hover:not(.active) {
+            background: #f8fafc;
+        }
+    </style>
+</head>
+<body class="bg-white">
+    <div class="max-w-[900px] mx-auto px-6 pt-6 pb-10">
+        
+        <!-- 顶部 -->
+        <div class="flex items-center justify-between mb-5">
+            <div>
+                <h1 class="text-2xl font-semibold tracking-tight text-slate-900">Clawbot 人设编辑器</h1>
+            </div>
+            <button onclick="exportFullPrompt()" 
+                    class="flex items-center gap-x-2 bg-slate-900 hover:bg-black text-white text-sm font-medium px-5 h-9 rounded-2xl">
+                <i class="fa-solid fa-download"></i>
+                <span>导出完整提示词</span>
+            </button>
+        </div>
+
+        <div class="flex gap-6">
+            
+            <!-- 左侧人物列表 -->
+            <div class="w-52 flex-shrink-0">
+                <div class="flex items-center justify-between mb-2 px-1">
+                    <span class="text-sm font-semibold text-slate-600">人物</span>
+                    <button onclick="addCharacter()" 
+                            class="text-xs px-2.5 py-1 bg-slate-900 text-white rounded-xl flex items-center gap-x-1 hover:bg-black">
+                        <i class="fa-solid fa-plus text-[10px]"></i>
+                        <span class="text-xs">添加</span>
+                    </button>
+                </div>
+                
+                <div id="character-list" class="space-y-1 text-sm">
+                    <!-- JS 渲染人物列表 -->
+                </div>
+            </div>
+
+            <!-- 右侧主内容 -->
+            <div class="flex-1 min-w-0">
+                
+                <!-- 当前人物标题 -->
+                <div class="mb-4 flex items-center">
+                    <div id="current-character-name" class="text-xl font-semibold text-slate-900"></div>
+                </div>
+
+                <!-- 居中选项卡 -->
+                <div class="flex border-b border-slate-200 mb-6">
+                    <div onclick="switchTab('persona')" class="tab active" id="tab-persona">人设</div>
+                    <div onclick="switchTab('history')" class="tab" id="tab-history">聊天记录</div>
+                    <div onclick="switchTab('memory')" class="tab" id="tab-memory">记忆设置</div>
+                </div>
+
+                <!-- 人设 -->
+                <div id="content-persona" class="content active">
+                    <div class="space-y-6 max-w-2xl">
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 mb-1.5">核心人设描述</label>
+                            <textarea id="persona-description" rows="7" 
+                                      class="w-full border border-slate-300 rounded-3xl px-4 py-3 text-[15px] leading-relaxed focus:outline-none focus:border-slate-400"
+                                      placeholder="描述这个人物的身份、性格、说话风格和行为规则..."></textarea>
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 mb-1.5">性格特点（每行一项）</label>
+                            <textarea id="persona-traits" rows="3" 
+                                      class="w-full border border-slate-300 rounded-3xl px-4 py-3 text-sm focus:outline-none focus:border-slate-400"
+                                      placeholder="幽默&#10;诚实&#10;喜欢吐槽"></textarea>
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 mb-1.5">示例对话（可选）</label>
+                            <textarea id="persona-examples" rows="4" 
+                                      class="w-full border border-slate-300 rounded-3xl px-4 py-3 text-sm font-mono focus:outline-none focus:border-slate-400"
+                                      placeholder="用户：你今天心情怎么样？&#10;Clawbot：还行吧，就是又被你烦了。"></textarea>
+                        </div>
+
+                        <button onclick="saveCurrentPersona()" 
+                                class="w-full h-11 bg-slate-900 hover:bg-black text-white font-medium rounded-2xl">
+                            保存人设
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 聊天记录 -->
+                <div id="content-history" class="content">
+                    <div class="space-y-2" id="history-container">
+                        <!-- JS 动态生成 -->
+                    </div>
+                    <button onclick="addChatRecord()" 
+                            class="mt-4 text-sm px-4 py-2 bg-slate-100 hover:bg-slate-200 rounded-2xl flex items-center gap-x-2 text-slate-700">
+                        <i class="fa-solid fa-plus"></i>
+                        <span>添加聊天记录</span>
+                    </button>
+                </div>
+
+                <!-- 记忆设置 -->
+                <div id="content-memory" class="content">
+                    <div class="space-y-8 max-w-2xl">
+                        
+                        <!-- 记住的事 -->
+                        <div>
+                            <div class="flex items-center justify-between mb-2">
+                                <div class="font-semibold text-sm">记住的事</div>
+                                <button onclick="addMemory()" 
+                                        class="text-xs px-3 py-1 bg-slate-100 hover:bg-slate-200 rounded-xl flex items-center gap-x-1 text-slate-700">
+                                    <i class="fa-solid fa-plus text-[10px]"></i>
+                                    <span>添加</span>
+                                </button>
+                            </div>
+                            <div id="memory-list" class="space-y-1.5 text-sm"></div>
+                        </div>
+
+                        <!-- 提示词记忆 -->
+                        <div>
+                            <div class="flex items-center justify-between mb-2">
+                                <div class="font-semibold text-sm">提示词记忆</div>
+                                <button onclick="addPromptMemory()" 
+                                        class="text-xs px-3 py-1 bg-slate-100 hover:bg-slate-200 rounded-xl flex items-center gap-x-1 text-slate-700">
+                                    <i class="fa-solid fa-plus text-[10px]"></i>
+                                    <span>添加</span>
+                                </button>
+                            </div>
+                            <div id="prompt-memory-list" class="space-y-1.5 text-sm"></div>
+                        </div>
+
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let data = {
+            characters: []
+        };
+        let currentCharacterId = null;
+
+        function loadData() {
+            const saved = localStorage.getItem('clawbot_persona_v2');
+            if (saved) {
+                data = JSON.parse(saved);
+            }
+
+            // 如果没有人物，创建一个默认的
+            if (data.characters.length === 0) {
+                const defaultChar = createNewCharacter("默认 Clawbot");
+                data.characters.push(defaultChar);
+                currentCharacterId = defaultChar.id;
+                saveData();
+            } else {
+                // 默认选中第一个
+                if (!currentCharacterId) {
+                    currentCharacterId = data.characters[0].id;
+                }
+            }
+        }
+
+        function saveData() {
+            localStorage.setItem('clawbot_persona_v2', JSON.stringify(data));
+        }
+
+        function createNewCharacter(name) {
+            return {
+                id: 'char_' + Date.now(),
+                name: name,
+                persona: {
+                    description: "",
+                    traits: "",
+                    examples: ""
+                },
+                history: [],
+                memories: [],
+                promptMemories: []
+            };
+        }
+
+        // 切换当前人物
+        function switchCharacter(charId) {
+            currentCharacterId = charId;
+            renderCharacterList();
+            renderCurrentCharacter();
+        }
+
+        function getCurrentCharacter() {
+            return data.characters.find(c => c.id === currentCharacterId);
+        }
+
+        // 渲染左侧人物列表
+        function renderCharacterList() {
+            const container = document.getElementById('character-list');
+            container.innerHTML = '';
+
+            data.characters.forEach(char => {
+                const div = document.createElement('div');
+                div.className = `character-item flex items-center justify-between px-3 py-2 rounded-xl text-sm cursor-pointer ${char.id === currentCharacterId ? 'active' : ''}`;
+                div.innerHTML = `
+                    <div class="flex-1 truncate">${char.name}</div>
+                    <div class="flex items-center gap-1">
+                        <button onclick="event.stopImmediatePropagation(); renameCharacter('${char.id}')" 
+                                class="text-slate-400 hover:text-slate-600 px-1 opacity-60 hover:opacity-100">
+                            <i class="fa-solid fa-pen text-xs"></i>
+                        </button>
+                        <button onclick="event.stopImmediatePropagation(); deleteCharacter('${char.id}')" 
+                                class="text-red-400 hover:text-red-500 px-1 opacity-60 hover:opacity-100">
+                            <i class="fa-solid fa-times text-xs"></i>
+                        </button>
+                    </div>
+                `;
+                div.onclick = () => switchCharacter(char.id);
+                container.appendChild(div);
+            });
+        }
+
+        function addCharacter() {
+            const name = prompt("请输入新人物名称：", "新 Clawbot");
+            if (!name || !name.trim()) return;
+
+            const newChar = createNewCharacter(name.trim());
+            data.characters.push(newChar);
+            currentCharacterId = newChar.id;
+            saveData();
+            renderCharacterList();
+            renderCurrentCharacter();
+        }
+
+        function deleteCharacter(charId) {
+            if (data.characters.length <= 1) {
+                alert("至少需要保留一个人物");
+                return;
+            }
+            if (!confirm("确定删除这个人物及其所有数据吗？")) return;
+
+            data.characters = data.characters.filter(c => c.id !== charId);
+            
+            if (currentCharacterId === charId) {
+                currentCharacterId = data.characters[0].id;
+            }
+            saveData();
+            renderCharacterList();
+            renderCurrentCharacter();
+        }
+
+        function renameCharacter(charId) {
+            const char = data.characters.find(c => c.id === charId);
+            if (!char) return;
+
+            const newName = prompt("请输入新名称：", char.name);
+            if (!newName || !newName.trim() || newName.trim() === char.name) return;
+
+            char.name = newName.trim();
+            saveData();
+            renderCharacterList();
+
+            // 如果是当前选中的人物，同步更新顶部名称
+            if (charId === currentCharacterId) {
+                document.getElementById('current-character-name').textContent = char.name;
+            }
+        }
+
+        // 渲染当前人物的内容
+        function renderCurrentCharacter() {
+            const char = getCurrentCharacter();
+            if (!char) return;
+
+            // 更新标题
+            document.getElementById('current-character-name').textContent = char.name;
+
+            // 加载人设
+            loadPersonaForCurrent();
+
+            // 渲染聊天记录
+            renderHistory();
+
+            // 渲染记忆
+            renderMemories();
+
+            // 确保当前tab的内容是最新的
+            const activeTab = document.querySelector('.tab.active');
+            if (activeTab) {
+                const tabName = activeTab.id.replace('tab-', '');
+                // 如果需要可以在这里强制刷新特定内容
+            }
+        }
+
+        // ===== 人设 =====
+        function loadPersonaForCurrent() {
+            const char = getCurrentCharacter();
+            if (!char) return;
+
+            document.getElementById('persona-description').value = char.persona.description || '';
+            document.getElementById('persona-traits').value = char.persona.traits || '';
+            document.getElementById('persona-examples').value = char.persona.examples || '';
+        }
+
+        function saveCurrentPersona() {
+            const char = getCurrentCharacter();
+            if (!char) return;
+
+            char.persona.description = document.getElementById('persona-description').value.trim();
+            char.persona.traits = document.getElementById('persona-traits').value.trim();
+            char.persona.examples = document.getElementById('persona-examples').value.trim();
+            
+            saveData();
+            alert('人设已保存！');
+        }
+
+        // ===== 聊天记录 =====
+        function renderHistory() {
+            const container = document.getElementById('history-container');
+            container.innerHTML = '';
+
+            const char = getCurrentCharacter();
+            if (!char || char.history.length === 0) {
+                container.innerHTML = `<div class="text-center py-6 text-sm text-slate-400">暂无聊天记录</div>`;
+                return;
+            }
+
+            // 按日期排序（最新在前）
+            const sorted = [...char.history].sort((a, b) => b.date.localeCompare(a.date));
+
+            sorted.forEach((chat, index) => {
+                const div = document.createElement('div');
+                div.className = 'border border-slate-200 rounded-2xl p-4 mb-2';
+                div.innerHTML = `
+                    <div class="flex justify-between items-start">
+                        <div>
+                            <div class="font-medium">${chat.title}</div>
+                            <div class="text-xs text-slate-500 mt-0.5">${chat.date} · ${chat.messages} 条消息</div>
+                        </div>
+                        <button onclick="deleteHistory(${index}, event)" 
+                                class="text-red-400 hover:text-red-500 text-xs px-2 py-1">删除</button>
+                    </div>
+                    <div class="mt-2 text-sm text-slate-600 border-l-2 border-slate-200 pl-3 line-clamp-2">
+                        ${chat.preview || '点击查看完整记录...'}
+                    </div>
+                `;
+                div.onclick = () => showChatDetail(index);
+                container.appendChild(div);
+            });
+        }
+
+        function showChatDetail(index) {
+            const char = getCurrentCharacter();
+            const chat = char.history[index];
+            if (!chat) return;
+
+            const newContent = prompt(
+                `【${chat.date}】 ${chat.title}\n\n请输入或粘贴完整聊天记录（演示）：`,
+                chat.preview || '用户：...\nClawbot：...'
+            );
+            
+            if (newContent !== null) {
+                chat.preview = newContent.substring(0, 80);
+                // 这里可以扩展存储完整对话
+                saveData();
+                renderHistory();
+            }
+        }
+
+        function deleteHistory(index, e) {
+            e.stopImmediatePropagation();
+            if (!confirm('删除这条聊天记录？')) return;
+            const char = getCurrentCharacter();
+            char.history.splice(index, 1);
+            saveData();
+            renderHistory();
+        }
+
+        function addChatRecord() {
+            const char = getCurrentCharacter();
+            const title = prompt("聊天记录标题：", "新对话");
+            if (!title) return;
+
+            const date = prompt("日期（YYYY-MM-DD）：", new Date().toISOString().split('T')[0]);
+            if (!date) return;
+
+            char.history.unshift({
+                id: 'h' + Date.now(),
+                date: date,
+                title: title,
+                messages: 0,
+                preview: ""
+            });
+            saveData();
+            renderHistory();
+        }
+
+        // ===== 记忆设置 =====
+        function renderMemories() {
+            const char = getCurrentCharacter();
+            if (!char) return;
+
+            // 记住的事
+            const memList = document.getElementById('memory-list');
+            memList.innerHTML = '';
+
+            char.memories.forEach((mem, index) => {
+                const div = document.createElement('div');
+                div.className = 'memory-item border border-slate-200 rounded-2xl px-4 py-2.5 flex items-center justify-between text-sm';
+                div.innerHTML = `
+                    <div class="flex-1 pr-3">${mem}</div>
+                    <div class="flex gap-1">
+                        <button onclick="editMemory(${index})" class="text-slate-400 hover:text-slate-600 px-1.5">
+                            <i class="fa-solid fa-edit text-xs"></i>
+                        </button>
+                        <button onclick="deleteMemory(${index})" class="text-red-400 hover:text-red-500 px-1.5">
+                            <i class="fa-solid fa-trash text-xs"></i>
+                        </button>
+                    </div>
+                `;
+                memList.appendChild(div);
+            });
+
+            // 提示词记忆
+            const promptList = document.getElementById('prompt-memory-list');
+            promptList.innerHTML = '';
+
+            char.promptMemories.forEach((mem, index) => {
+                const div = document.createElement('div');
+                div.className = 'memory-item border border-slate-200 rounded-2xl px-4 py-2.5 flex items-center justify-between text-sm';
+                div.innerHTML = `
+                    <div class="flex-1 pr-3 font-mono text-xs leading-relaxed">${mem}</div>
+                    <div class="flex gap-1">
+                        <button onclick="editPromptMemory(${index})" class="text-slate-400 hover:text-slate-600 px-1.5">
+                            <i class="fa-solid fa-edit text-xs"></i>
+                        </button>
+                        <button onclick="deletePromptMemory(${index})" class="text-red-400 hover:text-red-500 px-1.5">
+                            <i class="fa-solid fa-trash text-xs"></i>
+                        </button>
+                    </div>
+                `;
+                promptList.appendChild(div);
+            });
+        }
+
+        function addMemory() {
+            const char = getCurrentCharacter();
+            const content = prompt('输入要记住的事：');
+            if (!content) return;
+            char.memories.push(content.trim());
+            saveData();
+            renderMemories();
+        }
+
+        function editMemory(index) {
+            const char = getCurrentCharacter();
+            const newVal = prompt('编辑记忆：', char.memories[index]);
+            if (newVal === null) return;
+            char.memories[index] = newVal.trim();
+            saveData();
+            renderMemories();
+        }
+
+        function deleteMemory(index) {
+            if (!confirm('删除这条记忆？')) return;
+            const char = getCurrentCharacter();
+            char.memories.splice(index, 1);
+            saveData();
+            renderMemories();
+        }
+
+        function addPromptMemory() {
+            const char = getCurrentCharacter();
+            const content = prompt('输入要加入提示词的记忆/规则：');
+            if (!content) return;
+            char.promptMemories.push(content.trim());
+            saveData();
+            renderMemories();
+        }
+
+        function editPromptMemory(index) {
+            const char = getCurrentCharacter();
+            const newVal = prompt('编辑提示词记忆：', char.promptMemories[index]);
+            if (newVal === null) return;
+            char.promptMemories[index] = newVal.trim();
+            saveData();
+            renderMemories();
+        }
+
+        function deletePromptMemory(index) {
+            if (!confirm('删除这条提示词记忆？')) return;
+            const char = getCurrentCharacter();
+            char.promptMemories.splice(index, 1);
+            saveData();
+            renderMemories();
+        }
+
+        // ===== 导出完整提示词 =====
+        function exportFullPrompt() {
+            const char = getCurrentCharacter();
+            if (!char) return;
+
+            let prompt = `你是 ${char.name}。\n\n`;
+            
+            if (char.persona.description) {
+                prompt += `【核心人设】\n${char.persona.description}\n\n`;
+            }
+            if (char.persona.traits) {
+                prompt += `【性格特点】\n${char.persona.traits}\n\n`;
+            }
+            if (char.persona.examples) {
+                prompt += `【示例对话】\n${char.persona.examples}\n\n`;
+            }
+
+            if (char.promptMemories.length > 0) {
+                prompt += `【必须遵守的提示词记忆】\n`;
+                char.promptMemories.forEach(m => prompt += `- ${m}\n`);
+                prompt += `\n`;
+            }
+
+            if (char.memories.length > 0) {
+                prompt += `【你需要记住的用户信息】\n`;
+                char.memories.forEach(m => prompt += `- ${m}\n`);
+                prompt += `\n`;
+            }
+
+            prompt += `请严格按照以上人设和记忆回复用户。`;
+
+            navigator.clipboard.writeText(prompt).then(() => {
+                alert('完整提示词已复制到剪贴板！\n\n可直接用于你的 Clawbot。');
+            }).catch(() => {
+                const textarea = document.createElement('textarea');
+                textarea.value = prompt;
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textarea);
+                alert('完整提示词已复制到剪贴板！');
+            });
+        }
+
+        // 切换标签页
+        function switchTab(tab) {
+            document.querySelectorAll('.content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+
+            document.getElementById('content-' + tab).classList.add('active');
+            document.getElementById('tab-' + tab).classList.add('active');
+        }
+
+        // 初始化
+        function init() {
+            loadData();
+            renderCharacterList();
+            renderCurrentCharacter();
+
+            // 默认选中人设标签
+            switchTab('persona');
+        }
+
+        window.onload = init;
+    </script>
+</body>
+</html>
