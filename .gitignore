@@ -1,0 +1,13 @@
+config.json
+config.*.json
+!config.example.json
+__pycache__/
+*.py[cod]
+*.log
+bot-input.txt
+qrcode.png
+wechat-clawbot-qrcode.png
+*.zip
+.env
+.env.*
+

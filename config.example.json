@@ -1,0 +1,22 @@
+{
+  "provider": "deepseek",
+  "default_model": "gemini",
+  "current_model": "gpt5.5",
+  "providers": {
+    "deepseek": {
+      "api_key": "replace-with-your-api-key",
+      "base_url": "https://api.dzzi.ai/v1",
+      "model": "[按量]gemini-3-flash-preview",
+      "prompt": "你是一个有帮助的 AI 助手，请用中文简洁地回复。"
+    }
+  },
+  "models": {
+    "gemini": {
+      "model": "[按量]gemini-3-flash-preview"
+    },
+    "gpt5.5": {
+      "model": "gpt-5.5"
+    }
+  }
+}
+

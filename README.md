@@ -313,3 +313,11 @@ POST getupdates（长轮询，服务器 hold 35s）
 - [OpenClaw 官方文档](https://docs.openclaw.ai)
 - [官方 npm 包](https://www.npmjs.com/package/@tencent-weixin/openclaw-weixin)
 - [DusAPI（兼容多模型的 AI 接口）](https://dusapi.com)
+## GitHub 同步
+
+公开模型设置保存在 `settings.json`，可通过 GitHub Pages 设置页生成并提交：
+
+https://qi3474942281.github.io/bot-/
+
+运行 `sync-and-start.cmd` 会先同步公开设置，再启动机器人。`config.json`
+始终只保存在运行机器上，其中的 API Key 和接口地址不会上传。

@@ -9,9 +9,11 @@ import aiohttp
 import time
 import urllib.request
 from urllib.parse import quote
+from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 from dusapi import DusAPI, DusConfig
 from deepseek import DeepSeekAPI, DeepSeekConfig
+from sync_from_github import sync_public_settings
 
 executor = ThreadPoolExecutor(max_workers=4)
 ai = None  # 启动时从配置文件加载后初始化
@@ -37,6 +39,9 @@ ILINK_APP_ID = "bot"
 ILINK_APP_CLIENT_VERSION = str((2 << 16) | (4 << 8) | 3)
 BOT_AGENT = "weixin-ClawBot-API/1.0.1 (python)"
 
+# Only public model preferences are synchronized. Secrets remain in config.json.
+sync_public_settings()
+
 PROVIDERS = {
     "dusapi": {
         "label": "DusAPI",
@@ -51,6 +56,68 @@ PROVIDERS = {
         "prompt": _DEFAULT_PROMPT,
     },
 }
+
+
+def get_model_profiles() -> dict:
+    cfg = load_config_file()
+    return cfg.get("models") or {}
+
+
+def get_active_model_key() -> str | None:
+    cfg = load_config_file()
+    models = cfg.get("models") or {}
+    if not models:
+        return None
+    preferred = cfg.get("current_model") or cfg.get("default_model")
+    if preferred in models:
+        return preferred
+    return next(iter(models))
+
+
+def get_active_model_name() -> str | None:
+    models = get_model_profiles()
+    active_key = get_active_model_key()
+    if not active_key:
+        return None
+    return models.get(active_key, {}).get("model")
+
+
+def save_active_model_key(model_key: str):
+    cfg = load_config_file()
+    cfg["current_model"] = model_key
+    save_config_file(cfg)
+
+
+def format_model_list() -> str:
+    models = get_model_profiles()
+    active_key = get_active_model_key()
+    if not models:
+        return "No models configured."
+
+    lines = ["Available models:"]
+    for key, item in models.items():
+        mark = " *" if key == active_key else ""
+        lines.append(f"/model {key}{mark} -> {item.get('model', '')}")
+    return "\n".join(lines)
+
+
+def handle_model_command(text: str) -> tuple[bool, str | None]:
+    stripped = text.strip()
+    if not stripped.startswith("/model"):
+        return False, None
+
+    parts = stripped.split(maxsplit=1)
+    if len(parts) == 1:
+        return True, format_model_list()
+
+    model_key = parts[1].strip().lower()
+    models = get_model_profiles()
+    if model_key not in models:
+        return True, f"Unknown model: {model_key}\n\n{format_model_list()}"
+
+    save_active_model_key(model_key)
+    model_name = models[model_key].get("model", "")
+    return True, f"Switched model to {model_key}: {model_name}"
 
 
 def mask_key(key: str) -> str:
@@ -463,6 +530,18 @@ def render_generated_qr(content: str):
 def save_qrcode_content(content: str):
     if not content:
         return
+
+    def save_generated_png(raw_content: str) -> bool:
+        try:
+            import qrcode
+            img = qrcode.make(raw_content)
+            img.save("qrcode.png")
+            print("qrcode.png saved. Open it and scan with WeChat.")
+            return True
+        except Exception as e:
+            print(f"Failed to generate qrcode.png: {e}")
+            return False
+
     if content.startswith("data:image/"):
         header, b64 = content.split(",", 1)
         m = re.search(r"data:image/(\w+)", header)
@@ -475,14 +554,16 @@ def save_qrcode_content(content: str):
             f.write(content)
         print("二维码已保存到 qrcode.svg，用浏览器打开")
     elif content.startswith("http"):
-        render_terminal_qr(content)
+        if not save_generated_png(content):
+            render_terminal_qr(content)
     else:
         try:
             with open("qrcode.png", "wb") as f:
                 f.write(base64.b64decode(content))
             print("二维码已保存到 qrcode.png")
         except Exception:
-            render_terminal_qr(content)
+            if not save_generated_png(content):
+                render_terminal_qr(content)
 
 
 async def fetch_login_qrcode(session, base_url=BASE_URL, local_token_list=None):
@@ -612,28 +693,12 @@ async def main():
         bot_token = login_result["bot_token"]
         bot_base_url = login_result.get("baseurl", "")
         print(f"登录成功！baseurl={bot_base_url}")
-        print(f"{'='*40}\n{COMMANDS_MSG}\n{'='*40}")
-
-        # 3. 共享状态（可变引用，传给定时器任务和消息循环）
+        # 3. 消息循环所需状态
         bot_token_ref = [bot_token]
         bot_base_url_ref = [bot_base_url]
-        last_contact = {"from_id": None, "context_token": None}
         typing_ticket_cache = {}
-        welcomed_users = set()
-        reconnect_asked = asyncio.Event()
-        warning_active = [False]
-        reconnect_in_progress = [False]
-        login_time_ref = [time.time()]
-        manual_reconnect_pending = {}  # {from_id: True} 等待用户确认手动重连
 
-        # 4. 启动定时器任务（与消息循环并发）
-        asyncio.create_task(reconnect_timer_task(
-            session, bot_token_ref, bot_base_url_ref, last_contact,
-            typing_ticket_cache, reconnect_asked, warning_active,
-            reconnect_in_progress, login_time_ref, RECONNECT_CONFIG,
-        ))
-
-        # 5. 长轮询收消息
+        # 4. 长轮询收消息
         get_updates_buf = ""
         print("开始监听消息...")
         while True:
@@ -654,73 +719,11 @@ async def main():
                 context_token = msg["context_token"]
                 print(f"收到消息: {text}")
 
-                # 更新最近联系人（定时器任务用于发通知）
-                last_contact["from_id"] = from_id
-                last_contact["context_token"] = context_token
-
-                # 优先级 1：手动重连 Y/N 确认（/重新连接 发出后等待回复）
-                if manual_reconnect_pending.get(from_id) and text.strip().upper() in ("Y", "N"):
-                    del manual_reconnect_pending[from_id]
-                    if text.strip().upper() == "Y":
-                        await send_msg_safe(session, from_id, context_token,
-                                            "好的，正在重新连接...",
-                                            bot_token_ref, bot_base_url_ref)
-                        await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                                           typing_ticket_cache, reconnect_asked, warning_active,
-                                           reconnect_in_progress, login_time_ref, RECONNECT_CONFIG)
-                    else:
-                        await send_msg_safe(session, from_id, context_token,
-                                            "已取消重新连接",
-                                            bot_token_ref, bot_base_url_ref)
-                    continue
-
-                # 优先级 2：定时预警 Y/N 处理
-                if warning_active[0] and text.strip().upper() in ("Y", "N"):
-                    if text.strip().upper() == "Y":
-                        reconnect_asked.set()
-                        await send_msg_safe(session, from_id, context_token,
-                                            "好的，正在重新连接...",
-                                            bot_token_ref, bot_base_url_ref)
-                    else:
-                        await send_msg_safe(session, from_id, context_token,
-                                            "好的，稍后再提醒您",
-                                            bot_token_ref, bot_base_url_ref)
-                    continue
-
-                # 优先级 3：首次交互，发送指令列表
-                if from_id not in welcomed_users:
-                    welcomed_users.add(from_id)
+                is_model_command, model_reply = handle_model_command(text)
+                if is_model_command:
                     await send_msg_safe(session, from_id, context_token,
-                                        COMMANDS_MSG, bot_token_ref, bot_base_url_ref)
-                    continue
-
-                # /help  /指令 — 返回指令列表
-                if text.strip() in ("/help", "/指令"):
-                    await send_msg_safe(session, from_id, context_token,
-                                        COMMANDS_MSG, bot_token_ref, bot_base_url_ref)
-                    continue
-
-                # /time 指令
-                if text.strip() == "/time":
-                    _rem = max(0, login_time_ref[0] + RECONNECT_CONFIG["session_duration"] - time.time())
-                    _h, _m, _s = int(_rem // 3600), int((_rem % 3600) // 60), int(_rem % 60)
-                    _ts = f"{_h} 小时 {_m} 分钟" if _h > 0 else f"{_m} 分钟 {_s} 秒"
-                    await send_msg_safe(session, from_id, context_token,
-                                        f"当前连接剩余时间：{_ts}",
+                                        model_reply or format_model_list(),
                                         bot_token_ref, bot_base_url_ref)
-                    continue
-
-                # /重新连接 — 手动触发重连，等待 Y/N 确认
-                if text.strip() == "/重新连接":
-                    if reconnect_in_progress[0]:
-                        await send_msg_safe(session, from_id, context_token,
-                                            "重连正在进行中，请稍候...",
-                                            bot_token_ref, bot_base_url_ref)
-                    else:
-                        manual_reconnect_pending[from_id] = True
-                        await send_msg_safe(session, from_id, context_token,
-                                            "确认要立即重新连接吗？\n回复 Y 确认重连 / N 取消",
-                                            bot_token_ref, bot_base_url_ref)
                     continue
 
                 # getconfig 获取 typing_ticket（每个用户缓存一次）
@@ -750,7 +753,11 @@ async def main():
                 # 调用 AI
                 loop = asyncio.get_event_loop()
                 # 或者替换为你自已要用的接口
-                reply = await loop.run_in_executor(executor, ai.chat, text)
+                active_model = get_active_model_name()
+                reply = await loop.run_in_executor(
+                    executor,
+                    partial(ai.chat, text, model=active_model),
+                )
 
                 # sendmessage（补全 SDK 所需字段）
                 client_id = f"openclaw-weixin-{random.randint(0, 0xFFFFFFFF):08x}"

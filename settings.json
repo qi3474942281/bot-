@@ -1,0 +1,13 @@
+{
+  "default_model": "gemini",
+  "current_model": "gpt5.5",
+  "models": {
+    "gemini": {
+      "model": "[按量]gemini-3-flash-preview"
+    },
+    "gpt5.5": {
+      "model": "gpt-5.5"
+    }
+  }
+}
+

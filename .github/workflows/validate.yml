@@ -1,0 +1,33 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate Python syntax
+        run: python -m py_compile bot.py deepseek.py dusapi.py sync_from_github.py
+      - name: Validate public settings
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          settings = json.loads(Path("settings.json").read_text(encoding="utf-8"))
+          models = settings.get("models")
+          assert isinstance(models, dict) and models, "models must be a non-empty object"
+          for key in ("default_model", "current_model"):
+              assert settings.get(key) in models, f"{key} must reference a model key"
+          PY
+      - name: Reject committed secrets
+        run: |
+          test ! -e config.json
+          ! grep -RInE 'api_key"[[:space:]]*:[[:space:]]*"sk-[A-Za-z0-9_-]{16,}' \
+            --exclude=config.example.json --exclude-dir=.git .
