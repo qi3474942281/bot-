@@ -49,6 +49,30 @@
     .history-row.user .history-meta { text-align: right; }
     .history-bubble { padding: 12px 16px; border: 1px solid #dbe3ee; border-radius: 6px 18px 18px 18px; background: #fff; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: 0 1px 2px rgba(15, 23, 42, .04); }
     .history-row.user .history-bubble { border-color: #0f172a; border-radius: 18px 6px 18px 18px; color: #fff; background: #0f172a; }
+    .memory-layout { display: grid; grid-template-columns: 210px minmax(0, 1fr); min-height: 520px; overflow: hidden; border: 1px solid #e2e8f0; border-radius: 18px; }
+    .memory-nav { padding: 14px; border-right: 1px solid #e2e8f0; background: #f8fafc; }
+    .memory-nav-button { display: block; width: 100%; margin-bottom: 8px; padding: 14px; border: 0; border-radius: 13px; color: #475569; background: transparent; text-align: left; }
+    .memory-nav-button.active { color: #fff; background: #0f172a; font-weight: 700; }
+    .memory-content { min-width: 0; padding: 24px; }
+    .memory-section-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+    .memory-section-header h3 { margin: 0; }
+    .memory-source { flex: 0 0 auto; padding: 3px 8px; border-radius: 999px; color: #475569; background: #e2e8f0; font-size: 12px; }
+    .memory-source.ai { color: #1d4ed8; background: #dbeafe; }
+    .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .setting-card { padding: 16px; border: 1px solid #e2e8f0; border-radius: 14px; background: #f8fafc; }
+    .setting-card label { margin: 0 0 8px; font-size: 14px; }
+    .setting-card input, .setting-card select { width: 100%; padding: 11px 12px; border: 1px solid #cbd5e1; border-radius: 10px; background: #fff; }
+    .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .switch-row input { width: 22px; height: 22px; }
+    .overview-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-bottom: 22px; }
+    .stat-card { padding: 14px; border-radius: 13px; background: #f1f5f9; }
+    .stat-card strong { display: block; margin-top: 4px; font-size: 18px; }
+    .memory-table-wrap { overflow-x: auto; margin: 12px 0 28px; }
+    .memory-table { width: 100%; min-width: 680px; border-collapse: collapse; }
+    .memory-table th, .memory-table td { padding: 12px; border: 1px solid #e2e8f0; text-align: left; vertical-align: top; }
+    .memory-table th { background: #f8fafc; }
+    .memory-table-actions { white-space: nowrap; }
+    .memory-error { margin-bottom: 18px; padding: 12px 14px; border-radius: 12px; color: #b91c1c; background: #fef2f2; }
     .connection { display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; margin-bottom: 28px; padding: 16px; border-radius: 16px; background: #f8fafc; }
     .connection input { padding: 10px 13px; border-radius: 10px; }
     #status { margin: 8px 0 0; color: #64748b; }
@@ -64,6 +88,11 @@
       .history-date { flex: 0 0 132px; margin: 0; }
       .history-messages { max-height: 560px; padding: 15px; }
       .history-message { max-width: 88%; }
+      .memory-layout { grid-template-columns: 1fr; }
+      .memory-nav { display: flex; gap: 8px; overflow-x: auto; border-right: 0; border-bottom: 1px solid #e2e8f0; }
+      .memory-nav-button { flex: 0 0 142px; margin: 0; }
+      .memory-content { padding: 16px; }
+      .settings-grid, .overview-stats { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -113,16 +142,17 @@
         </div>
 
         <div class="panel" id="memory">
-          <div class="sidebar-title">
-            <strong>记住的事</strong>
-            <button class="secondary" id="addMemory">+ 添加</button>
+          <div class="memory-layout">
+            <nav class="memory-nav" id="memoryNav">
+              <button class="memory-nav-button active" data-memory-section="facts">记住的事</button>
+              <button class="memory-nav-button" data-memory-section="rules">必须遵守的规则</button>
+              <button class="memory-nav-button" data-memory-section="settings">记忆设置</button>
+              <button class="memory-nav-button" data-memory-section="overview">记忆总览</button>
+            </nav>
+            <div class="memory-content" id="memoryContent">
+              <div class="empty">连接后显示记忆内容。</div>
+            </div>
           </div>
-          <div id="memoryList"></div>
-          <div class="sidebar-title" style="margin-top: 34px">
-            <strong>必须遵守的规则</strong>
-            <button class="secondary" id="addPromptMemory">+ 添加</button>
-          </div>
-          <div id="promptMemoryList"></div>
         </div>
       </section>
     </div>
@@ -133,6 +163,8 @@
     let history = [];
     let selectedHistoryDate = null;
     let selectedHistoryCharacterId = null;
+    let memoryData = null;
+    let selectedMemorySection = "facts";
 
     const elements = Object.fromEntries(
       [...document.querySelectorAll("[id]")].map(element => [element.id, element])
@@ -185,6 +217,7 @@
         const result = await api("/api/state");
         state = result.state;
         history = result.history || [];
+        await loadMemory();
         renderAll();
         setStatus("已连接云电脑，页面数据来自 ClawBot 后端。", "ok");
       } catch (error) {
@@ -199,6 +232,7 @@
           body: JSON.stringify({ state })
         });
         state = result.state;
+        await loadMemory();
         renderAll();
         setStatus(message, "ok");
       } catch (error) {
@@ -243,11 +277,18 @@
       elements.examples.value = character.persona.examples || "";
     }
 
+    async function loadMemory() {
+      const character = activeCharacter();
+      if (!character) return;
+      memoryData = await api(`/api/memory/${encodeURIComponent(character.id)}`);
+    }
+
     function memoryRows(values, type) {
       if (!values.length) return '<div class="empty">暂无内容</div>';
       return values.map((value, index) => `
         <div class="memory-row">
-          <div class="memory-text">${escapeHtml(value)}</div>
+          <div class="memory-text">${escapeHtml(type === "rules" ? value : value.content)}</div>
+          ${type === "facts" ? `<span class="memory-source ${value.source === "ai" ? "ai" : ""}">${value.source === "ai" ? "AI" : "用户"}</span>` : ""}
           <button class="icon-button edit-memory" data-type="${type}" data-index="${index}">编辑</button>
           <button class="icon-button danger delete-memory" data-type="${type}" data-index="${index}">删除</button>
         </div>
@@ -256,15 +297,113 @@
 
     function renderMemories() {
       const character = activeCharacter();
-      if (!character) return;
-      elements.memoryList.innerHTML = memoryRows(character.memories, "memories");
-      elements.promptMemoryList.innerHTML = memoryRows(character.promptMemories, "promptMemories");
+      if (!character || !memoryData || memoryData.characterId !== character.id) return;
+      elements.memoryNav.querySelectorAll(".memory-nav-button").forEach(button => {
+        button.classList.toggle("active", button.dataset.memorySection === selectedMemorySection);
+      });
+      if (selectedMemorySection === "facts") {
+        elements.memoryContent.innerHTML = `
+          <div class="memory-section-header"><h3>记住的事</h3><button class="secondary" id="addFact">+ 添加</button></div>
+          ${memoryRows(memoryData.facts, "facts")}
+        `;
+      } else if (selectedMemorySection === "rules") {
+        elements.memoryContent.innerHTML = `
+          <div class="memory-section-header"><h3>必须遵守的规则</h3><button class="secondary" id="addRule">+ 添加</button></div>
+          <p style="color:#64748b">这里只接受用户手动维护，AI 不会自动添加或修改。</p>
+          ${memoryRows(character.promptMemories, "rules")}
+        `;
+      } else if (selectedMemorySection === "settings") {
+        renderMemorySettings();
+      } else {
+        renderMemoryOverview();
+      }
       document.querySelectorAll(".edit-memory").forEach(button => {
-        button.addEventListener("click", () => editMemory(button.dataset.type, Number(button.dataset.index)));
+        button.addEventListener("click", () => editMemory(button.dataset.type, Number(button.dataset.index)).catch(handleMemoryError));
       });
       document.querySelectorAll(".delete-memory").forEach(button => {
-        button.addEventListener("click", () => deleteMemory(button.dataset.type, Number(button.dataset.index)));
+        button.addEventListener("click", () => deleteMemory(button.dataset.type, Number(button.dataset.index)).catch(handleMemoryError));
       });
+      document.getElementById("addFact")?.addEventListener("click", () => addMemory("facts", "输入要记住的关键信息：").catch(handleMemoryError));
+      document.getElementById("addRule")?.addEventListener("click", () => addMemory("rules", "输入必须遵守的规则：").catch(handleMemoryError));
+      document.getElementById("saveMemorySettings")?.addEventListener("click", () => saveMemorySettings().catch(handleMemoryError));
+      document.querySelectorAll(".edit-overview").forEach(button => {
+        button.addEventListener("click", () => editOverviewEntry(button.dataset.kind, Number(button.dataset.id)).catch(handleMemoryError));
+      });
+      document.querySelectorAll(".delete-overview").forEach(button => {
+        button.addEventListener("click", () => deleteOverviewEntry(Number(button.dataset.id)).catch(handleMemoryError));
+      });
+      document.querySelectorAll(".add-overview").forEach(button => {
+        button.addEventListener("click", () => addOverviewEntry(button.dataset.kind).catch(handleMemoryError));
+      });
+    }
+
+    async function handleMemoryError(error) {
+      setStatus(error.message || "记忆操作失败。", "error");
+      if (String(error.message || "").includes("已更新")) {
+        await loadMemory();
+        renderMemories();
+      }
+    }
+
+    function renderMemorySettings() {
+      const config = memoryData.config;
+      const modelOptions = Object.entries(memoryData.models || {}).map(([key, value]) => `
+        <option value="${escapeHtml(key)}" ${config.summaryModel === key ? "selected" : ""}>${escapeHtml(key)} · ${escapeHtml(value.model || "")}</option>
+      `).join("");
+      elements.memoryContent.innerHTML = `
+        <div class="memory-section-header"><h3>记忆设置</h3></div>
+        <div class="settings-grid">
+          <div class="setting-card"><label>总结模型</label><select id="summaryModel"><option value="">跟随当前聊天模型</option>${modelOptions}</select></div>
+          ${numberSetting("factRounds", "每多少轮生成一条关键事实", config.factRounds)}
+          ${numberSetting("stmRounds", "每多少轮生成一条 STM", config.stmRounds)}
+          ${numberSetting("ltmAfterStm", "每多少条 STM 生成一条 LTM", config.ltmAfterStm)}
+          ${numberSetting("stmMinChars", "STM 最少字数", config.stmMinChars)}
+          ${numberSetting("stmMaxChars", "STM 最多字数", config.stmMaxChars)}
+          ${numberSetting("ltmMinChars", "LTM 最少字数", config.ltmMinChars)}
+          ${numberSetting("ltmMaxChars", "LTM 最多字数", config.ltmMaxChars)}
+          <div class="setting-card switch-row"><label for="factsAuto">关键事实自动生成</label><input id="factsAuto" type="checkbox" ${config.factsAuto ? "checked" : ""}></div>
+          <div class="setting-card switch-row"><label for="engineAuto">STM/LTM 自动生成</label><input id="engineAuto" type="checkbox" ${config.engineAuto ? "checked" : ""}></div>
+        </div>
+        <button class="save" id="saveMemorySettings">保存记忆设置</button>
+      `;
+    }
+
+    function numberSetting(id, label, value) {
+      return `<div class="setting-card"><label for="${id}">${label}</label><input id="${id}" type="number" min="1" value="${value}"></div>`;
+    }
+
+    function renderMemoryOverview() {
+      const config = memoryData.config;
+      const progress = memoryData.progress;
+      const model = config.summaryModel || "跟随当前模型";
+      elements.memoryContent.innerHTML = `
+        <div class="memory-section-header"><h3>记忆总览</h3></div>
+        ${progress.lastError ? `<div class="memory-error">最近错误：${escapeHtml(progress.lastError)}</div>` : ""}
+        <div class="overview-stats">
+          <div class="stat-card">总结模型<strong>${escapeHtml(model)}</strong></div>
+          <div class="stat-card">关键事实进度<strong>${progress.factRounds} / ${config.factRounds}</strong><small>剩余 ${Math.max(0, config.factRounds - progress.factRounds)} 轮</small></div>
+          <div class="stat-card">STM 进度<strong>${progress.stmRounds} / ${config.stmRounds}</strong><small>剩余 ${Math.max(0, config.stmRounds - progress.stmRounds)} 轮</small></div>
+          <div class="stat-card">记忆数量<strong>${memoryData.ltm.length} LTM | ${memoryData.stm.length} STM</strong></div>
+          <div class="stat-card">下次清空 STM<strong>${progress.clearStmBeforeNext ? "是" : "否"}</strong></div>
+          <div class="stat-card">自动生成<strong>事实 ${config.factsAuto ? "开" : "关"} · 引擎 ${config.engineAuto ? "开" : "关"}</strong></div>
+        </div>
+        ${memoryTable("stm", "短期记忆区", memoryData.stm)}
+        ${memoryTable("ltm", "长期记忆区", memoryData.ltm)}
+      `;
+    }
+
+    function memoryTable(kind, title, rows) {
+      return `
+        <div class="memory-section-header"><h3>${title}</h3><button class="secondary add-overview" data-kind="${kind}">+ 添加</button></div>
+        <div class="memory-table-wrap"><table class="memory-table">
+          <thead><tr><th>No.</th><th>时间</th><th>场景</th><th>事件（字符数）</th><th>操作</th></tr></thead>
+          <tbody>${rows.length ? rows.map(item => `
+            <tr><td>${item.sequence_no}</td><td>${escapeHtml(item.time_label)}</td><td>${escapeHtml(item.scene)}</td>
+            <td>${escapeHtml(item.content)}（${[...item.content].length}）</td>
+            <td class="memory-table-actions"><button class="icon-button edit-overview" data-kind="${kind}" data-id="${item.id}">编辑</button><button class="icon-button danger delete-overview" data-id="${item.id}">删除</button></td></tr>
+          `).join("") : '<tr><td colspan="5" class="empty">暂无内容</td></tr>'}</tbody>
+        </table></div>
+      `;
     }
 
     function renderHistory() {
@@ -414,22 +553,112 @@
     async function addMemory(type, label) {
       const value = prompt(label);
       if (!value?.trim()) return;
-      activeCharacter()[type].push(value.trim());
-      await saveBackend("记忆已同步到 ClawBot。");
+      if (type === "rules") {
+        activeCharacter().promptMemories.push(value.trim());
+        await saveBackend("规则已同步到 ClawBot。");
+        return;
+      }
+      await api(`/api/memory/${encodeURIComponent(activeCharacter().id)}/entries`, {
+        method: "POST",
+        body: JSON.stringify({ kind: "fact", content: value.trim(), source: "user", version: memoryData.version })
+      });
+      await loadMemory();
+      renderMemories();
+      setStatus("关键信息已添加。", "ok");
     }
 
     async function editMemory(type, index) {
-      const list = activeCharacter()[type];
-      const value = prompt("编辑内容：", list[index]);
+      const item = type === "rules" ? activeCharacter().promptMemories[index] : memoryData.facts[index];
+      const value = prompt("编辑内容：", type === "rules" ? item : item.content);
       if (value === null || !value.trim()) return;
-      list[index] = value.trim();
-      await saveBackend("记忆已更新。");
+      if (type === "rules") {
+        activeCharacter().promptMemories[index] = value.trim();
+        await saveBackend("规则已更新。");
+        return;
+      }
+      await api(`/api/memory/${encodeURIComponent(activeCharacter().id)}/entries/${item.id}`, {
+        method: "PUT",
+        body: JSON.stringify({ content: value.trim(), timeLabel: "", scene: "", version: memoryData.version })
+      });
+      await loadMemory();
+      renderMemories();
+      setStatus("关键信息已更新，并标记为用户维护。", "ok");
     }
 
     async function deleteMemory(type, index) {
       if (!confirm("删除这条内容？")) return;
-      activeCharacter()[type].splice(index, 1);
-      await saveBackend("记忆已删除。");
+      if (type === "rules") {
+        activeCharacter().promptMemories.splice(index, 1);
+        await saveBackend("规则已删除。");
+        return;
+      }
+      await deleteMemoryEntry(memoryData.facts[index].id);
+      setStatus("关键信息已删除。", "ok");
+    }
+
+    async function saveMemorySettings() {
+      const ids = ["factRounds", "stmRounds", "stmMinChars", "stmMaxChars", "ltmAfterStm", "ltmMinChars", "ltmMaxChars"];
+      const config = { ...memoryData.config };
+      ids.forEach(id => config[id] = Number(document.getElementById(id).value));
+      config.summaryModel = document.getElementById("summaryModel").value;
+      config.factsAuto = document.getElementById("factsAuto").checked;
+      config.engineAuto = document.getElementById("engineAuto").checked;
+      memoryData = await api(`/api/memory/${encodeURIComponent(activeCharacter().id)}/config`, {
+        method: "PUT",
+        body: JSON.stringify({ config, version: memoryData.version })
+      });
+      renderMemories();
+      setStatus("记忆设置已保存。", "ok");
+    }
+
+    async function addOverviewEntry(kind) {
+      const timeLabel = prompt("输入时间或时间范围：", new Date().toLocaleString("zh-CN"));
+      if (timeLabel === null) return;
+      const scene = prompt("输入场景：", "");
+      if (scene === null) return;
+      const content = prompt("输入记忆正文：", "");
+      if (!content?.trim()) return;
+      await api(`/api/memory/${encodeURIComponent(activeCharacter().id)}/entries`, {
+        method: "POST",
+        body: JSON.stringify({ kind, timeLabel, scene, content: content.trim(), source: "user", version: memoryData.version })
+      });
+      await loadMemory();
+      renderMemories();
+      setStatus("记忆条目已添加。", "ok");
+    }
+
+    async function editOverviewEntry(kind, id) {
+      const list = kind === "stm" ? memoryData.stm : memoryData.ltm;
+      const item = list.find(entry => entry.id === id);
+      if (!item) return;
+      const timeLabel = prompt("编辑时间或时间范围：", item.time_label);
+      if (timeLabel === null) return;
+      const scene = prompt("编辑场景：", item.scene);
+      if (scene === null) return;
+      const content = prompt("编辑记忆正文：", item.content);
+      if (!content?.trim()) return;
+      await api(`/api/memory/${encodeURIComponent(activeCharacter().id)}/entries/${id}`, {
+        method: "PUT",
+        body: JSON.stringify({ timeLabel, scene, content: content.trim(), version: memoryData.version })
+      });
+      await loadMemory();
+      renderMemories();
+      setStatus("记忆条目已更新，并标记为用户维护。", "ok");
+    }
+
+    async function deleteOverviewEntry(id) {
+      if (!confirm("删除这条记忆？")) return;
+      await deleteMemoryEntry(id);
+      setStatus("记忆条目已删除。", "ok");
+    }
+
+    async function deleteMemoryEntry(id) {
+      await api(`/api/memory/${encodeURIComponent(activeCharacter().id)}/entries/${id}`, {
+        method: "DELETE",
+        body: JSON.stringify({ version: memoryData.version })
+      });
+      await loadMemory();
+      renderMemories();
     }
 
     function exportPrompt() {
@@ -441,7 +670,9 @@
       if (persona.traits) sections.push(`【性格特点】\n${persona.traits}`);
       if (persona.examples) sections.push(`【示例对话】\n${persona.examples}`);
       if (character.promptMemories.length) sections.push(`【必须遵守的规则】\n${character.promptMemories.map(item => `- ${item}`).join("\n")}`);
-      if (character.memories.length) sections.push(`【需要记住的信息】\n${character.memories.map(item => `- ${item}`).join("\n")}`);
+      if (memoryData?.facts.length) sections.push(`【需要记住的关键事实】\n${memoryData.facts.map(item => `- ${item.content}`).join("\n")}`);
+      if (memoryData?.stm.length) sections.push(`【短期记忆】\n${memoryData.stm.map(item => `${item.sequence_no}. ${item.time_label} | ${item.scene} | ${item.content}`).join("\n")}`);
+      if (memoryData?.ltm.length) sections.push(`【长期记忆】\n${memoryData.ltm.map(item => `${item.sequence_no}. ${item.time_label} | ${item.scene} | ${item.content}`).join("\n")}`);
       navigator.clipboard.writeText(sections.join("\n\n"))
         .then(() => setStatus("完整提示词已复制。", "ok"))
         .catch(() => setStatus("复制失败，请检查浏览器剪贴板权限。", "error"));
@@ -457,9 +688,13 @@
     elements.connect.addEventListener("click", loadBackend);
     elements.addCharacter.addEventListener("click", addCharacter);
     elements.savePersona.addEventListener("click", savePersona);
-    elements.addMemory.addEventListener("click", () => addMemory("memories", "输入要记住的事："));
-    elements.addPromptMemory.addEventListener("click", () => addMemory("promptMemories", "输入必须遵守的规则："));
     elements.exportPrompt.addEventListener("click", exportPrompt);
+    elements.memoryNav.addEventListener("click", event => {
+      const button = event.target.closest("[data-memory-section]");
+      if (!button) return;
+      selectedMemorySection = button.dataset.memorySection;
+      renderMemories();
+    });
 
     elements.apiUrl.value = localStorage.getItem("clawbot_api_url") || "";
     elements.apiToken.value = sessionStorage.getItem("clawbot_api_token") || "";

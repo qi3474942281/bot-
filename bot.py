@@ -122,6 +122,217 @@ def handle_model_command(text: str) -> tuple[bool, str | None]:
     return True, f"Switched model to {model_key}: {model_name}"
 
 
+def format_memory_settings() -> str:
+    character = clawbot_store.active_character()
+    snapshot = clawbot_store.memory_snapshot(character["id"])
+    config = snapshot["config"]
+    progress = snapshot["progress"]
+    model = config["summaryModel"] or get_active_model_key() or "未配置"
+    return "\n".join(
+        [
+            "记忆设置：",
+            f"- 总结模型：{model}",
+            f"- 关键事实：每 {config['factRounds']} 轮，自动生成 {'开' if config['factsAuto'] else '关'}",
+            f"- 短期记忆：每 {config['stmRounds']} 轮，{config['stmMinChars']}–{config['stmMaxChars']} 字",
+            f"- 长期记忆：每 {config['ltmAfterStm']} 条 STM，{config['ltmMinChars']}–{config['ltmMaxChars']} 字",
+            f"- STM/LTM 引擎：{'开' if config['engineAuto'] else '关'}",
+            f"- 当前进度：事实 {progress['factRounds']}/{config['factRounds']}，STM {progress['stmRounds']}/{config['stmRounds']}",
+            "",
+            "命令：/memory set <项目> <值>",
+            "项目：fact-rounds、stm-rounds、stm-min、stm-max、ltm-after-stm、ltm-min、ltm-max、model、facts-auto、engine-auto",
+        ]
+    )
+
+
+def handle_memory_command(text: str) -> tuple[bool, str | None]:
+    stripped = text.strip()
+    if not stripped.startswith("/memory"):
+        return False, None
+    if stripped == "/memory":
+        return True, format_memory_settings()
+
+    parts = stripped.split()
+    if len(parts) != 4 or parts[1].lower() != "set":
+        return True, "格式错误。\n\n" + format_memory_settings()
+
+    key, raw_value = parts[2].lower(), parts[3]
+    field_map = {
+        "fact-rounds": "factRounds",
+        "stm-rounds": "stmRounds",
+        "stm-min": "stmMinChars",
+        "stm-max": "stmMaxChars",
+        "ltm-after-stm": "ltmAfterStm",
+        "ltm-min": "ltmMinChars",
+        "ltm-max": "ltmMaxChars",
+    }
+    character = clawbot_store.active_character()
+    snapshot = clawbot_store.memory_snapshot(character["id"])
+    config = dict(snapshot["config"])
+    try:
+        if key in field_map:
+            value = int(raw_value)
+            if value <= 0:
+                raise ValueError("数值必须大于 0")
+            config[field_map[key]] = value
+        elif key == "model":
+            if raw_value not in get_model_profiles():
+                raise ValueError(f"未知模型：{raw_value}")
+            config["summaryModel"] = raw_value
+        elif key in {"facts-auto", "engine-auto"}:
+            if raw_value.lower() not in {"on", "off"}:
+                raise ValueError("开关值只能是 on 或 off")
+            config["factsAuto" if key == "facts-auto" else "engineAuto"] = (
+                raw_value.lower() == "on"
+            )
+        else:
+            raise ValueError(f"未知设置项：{key}")
+        clawbot_store.save_memory_config(
+            character["id"], config, snapshot["version"]
+        )
+        return True, "记忆设置已更新。\n\n" + format_memory_settings()
+    except (TypeError, ValueError) as error:
+        return True, f"记忆设置未修改：{error}"
+
+
+def _conversation_text(messages):
+    labels = {"user": "用户", "assistant": "ClawBot"}
+    return "\n".join(
+        f"[{item['created_at']}] {labels.get(item['role'], item['role'])}：{item['content']}"
+        for item in messages
+    )
+
+
+def _extract_json(text):
+    value = str(text or "").strip()
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", value, re.I)
+    if fenced:
+        value = fenced.group(1).strip()
+    start, end = value.find("{"), value.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("总结模型未返回 JSON")
+    result = json.loads(value[start : end + 1])
+    if not isinstance(result, dict):
+        raise ValueError("总结结果必须是对象")
+    return result
+
+
+def _summary_prompt(task, repair_error=None):
+    config = task["config"]
+    repair = (
+        f"\n上一次输出不合格：{repair_error}。请修正并只输出 JSON。"
+        if repair_error
+        else ""
+    )
+    if task["kind"] == "fact":
+        facts = "\n".join(
+            f"- id={item['id']}: {item['content']}"
+            for item in task["existingAiFacts"]
+        ) or "无"
+        return (
+            "从对话中提取一条必须长期记住的关键事实。每次必须产生结果。"
+            "若与下列 AI 事实相近，可融合并返回 merge；不得融合或改写用户手动事实。"
+            "内容应为一句或简短几句，保留专有名称、称呼、承诺和约定。\n"
+            f"已有 AI 事实：\n{facts}\n"
+            '只输出 JSON：{"action":"add","content":"..."} 或 '
+            '{"action":"merge","entryId":数字,"content":"融合后的内容"}。\n'
+            f"对话：\n{_conversation_text(task['messages'])}{repair}"
+        )
+    if task["kind"] == "stm":
+        return (
+            "将以下对话总结为一条客观短期记忆。保留时间顺序、专有名称、特殊称呼、"
+            "重要约定、承诺和宣言，不主观评价或推演。"
+            f"content 必须为 {config['stmMinChars']}–{config['stmMaxChars']} 个中文字符左右。"
+            '只输出 JSON：{"timeLabel":"时间或时间范围","scene":"场景",'
+            '"content":"客观事件"}。\n'
+            f"对话：\n{_conversation_text(task['messages'])}{repair}"
+        )
+    stm_text = "\n".join(
+        f"{item['sequence_no']}. {item['time_label']} | {item['scene']} | {item['content']}"
+        for item in task["stm"]
+    )
+    return (
+        "严格基于全部 STM 按先后顺序生成一条长期记忆。每条 STM 的信息占比尽量均衡，"
+        "不得遗漏剧情发展和角色细节，不得主观评价、推演未来或添加总结性结论。"
+        f"content 必须为 {config['ltmMinChars']}–{config['ltmMaxChars']} 个中文字符左右。"
+        '只输出 JSON：{"timeLabel":"整体时间范围","scene":"场景范围",'
+        '"content":"长期记忆正文"}。\n'
+        f"STM：\n{stm_text}{repair}"
+    )
+
+
+def _validate_summary_result(task, result):
+    content = str(result.get("content") or "").strip()
+    if not content:
+        raise ValueError("content 不能为空")
+    if task["kind"] == "fact":
+        if result.get("action") not in {"add", "merge"}:
+            raise ValueError("action 必须是 add 或 merge")
+        if result.get("action") == "merge":
+            allowed_ids = {item["id"] for item in task["existingAiFacts"]}
+            if result.get("entryId") not in allowed_ids:
+                raise ValueError("merge 只能引用已有 AI 事实的 entryId")
+        return
+    minimum = task["config"]["stmMinChars" if task["kind"] == "stm" else "ltmMinChars"]
+    maximum = task["config"]["stmMaxChars" if task["kind"] == "stm" else "ltmMaxChars"]
+    if not minimum <= len(content) <= maximum:
+        raise ValueError(f"content 字数必须在 {minimum}–{maximum} 之间，当前为 {len(content)}")
+    if not str(result.get("timeLabel") or "").strip():
+        raise ValueError("timeLabel 不能为空")
+    if not str(result.get("scene") or "").strip():
+        raise ValueError("scene 不能为空")
+
+
+def run_memory_summary(task):
+    model_key = task["config"]["summaryModel"] or get_active_model_key()
+    profiles = get_model_profiles()
+    if model_key not in profiles:
+        model_key = get_active_model_key()
+    model_name = profiles.get(model_key, {}).get("model")
+    last_error = None
+    for attempt in range(2):
+        prompt = _summary_prompt(task, last_error)
+        raw = ai.chat(
+            prompt,
+            model=model_name,
+            prompt="你是 ClawBot 的结构化记忆引擎。严格遵循用户要求，只输出指定 JSON。",
+            history=None,
+        )
+        try:
+            result = _extract_json(raw)
+            _validate_summary_result(task, result)
+            return result
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            last_error = str(error)
+    raise ValueError(last_error or "记忆总结失败")
+
+
+async def process_memory_tasks(loop, character_id, user_id):
+    failed = False
+    tasks = clawbot_store.prepare_memory_tasks(character_id, user_id)
+    for task in tasks:
+        try:
+            result = await loop.run_in_executor(
+                executor, partial(run_memory_summary, task)
+            )
+            if task["kind"] == "fact":
+                clawbot_store.complete_fact_task(task, result)
+            elif task["kind"] == "stm":
+                needs_ltm = clawbot_store.complete_stm_task(task, result)
+                if needs_ltm:
+                    ltm_task = clawbot_store.prepare_ltm_task(character_id)
+                    ltm_result = await loop.run_in_executor(
+                        executor, partial(run_memory_summary, ltm_task)
+                    )
+                    clawbot_store.complete_ltm_task(ltm_task, ltm_result)
+            else:
+                clawbot_store.complete_ltm_task(task, result)
+        except Exception as error:
+            failed = True
+            clawbot_store.mark_memory_error(character_id, str(error))
+            print(f"记忆总结失败: {error}")
+    return failed
+
+
 def mask_key(key: str) -> str:
     """保留前5位和后5位，中间用星号替换。"""
     if len(key) <= 10:
@@ -689,7 +900,7 @@ async def login_with_qrcode(session, base_url=BASE_URL):
 
 
 async def main():
-    await start_backend(clawbot_store)
+    await start_backend(clawbot_store, model_loader=get_model_profiles)
     async with aiohttp.ClientSession() as session:
         # 1. 获取二维码并等待扫码
         login_result = await login_with_qrcode(session)
@@ -729,6 +940,18 @@ async def main():
                                         bot_token_ref, bot_base_url_ref)
                     continue
 
+                is_memory_command, memory_reply = handle_memory_command(text)
+                if is_memory_command:
+                    await send_msg_safe(
+                        session,
+                        from_id,
+                        context_token,
+                        memory_reply or format_memory_settings(),
+                        bot_token_ref,
+                        bot_base_url_ref,
+                    )
+                    continue
+
                 # getconfig 获取 typing_ticket（每个用户缓存一次）
                 if from_id not in typing_ticket_cache:
                     cfg = await api_post(
@@ -756,6 +979,7 @@ async def main():
                 # 调用 AI
                 loop = asyncio.get_event_loop()
                 # 或者替换为你自已要用的接口
+                character_id = clawbot_store.active_character()["id"]
                 active_model = get_active_model_name()
                 active_prompt = clawbot_store.build_prompt(_raw_cfg["prompt"])
                 recent_history = clawbot_store.recent_history(from_id)
@@ -796,6 +1020,19 @@ async def main():
                 print(f"sendmessage 返回: {send_result}")
                 print(f"已回复: {reply[:50]}...")
 
+                memory_failed = await process_memory_tasks(
+                    loop, character_id, from_id
+                )
+                if memory_failed:
+                    await send_msg_safe(
+                        session,
+                        from_id,
+                        context_token,
+                        "记忆总结失败，稍后自动重试。",
+                        bot_token_ref,
+                        bot_base_url_ref,
+                    )
+
                 # sendtyping status=2 取消"正在输入"
                 if typing_ticket:
                     await api_post(
@@ -808,28 +1045,28 @@ async def main():
                     )
 
 
-print(
-    "\n"
-    "╔══════════════════════════════════════════════════════════╗\n"
-    "║          微信 ClawBot  ·  WeChat iLink Bot               ║\n"
-    "║  Copyright (c) 2026 SiverKing. All rights reserved.     ║\n"
-    "║  GitHub : https://github.com/SiverKing/weixin-ClawBot-API║\n"
-    "╚══════════════════════════════════════════════════════════╝"
-)
-
-_raw_cfg = load_or_create_config()
-if _raw_cfg["provider"] == "deepseek":
-    ai = DeepSeekAPI(DeepSeekConfig(
-        api_key=_raw_cfg["api_key"],
-        base_url=_raw_cfg["base_url"],
-        model=_raw_cfg["model"],
-        prompt=_raw_cfg["prompt"],
-    ))
-else:
-    ai = DusAPI(DusConfig(
-        api_key=_raw_cfg["api_key"],
-        base_url=_raw_cfg["base_url"],
-        model1=_raw_cfg["model"],
-        prompt=_raw_cfg["prompt"],
-    ))
-asyncio.run(main())
+if __name__ == "__main__":
+    print(
+        "\n"
+        "╔══════════════════════════════════════════════════════════╗\n"
+        "║          微信 ClawBot  ·  WeChat iLink Bot               ║\n"
+        "║  Copyright (c) 2026 SiverKing. All rights reserved.     ║\n"
+        "║  GitHub : https://github.com/SiverKing/weixin-ClawBot-API║\n"
+        "╚══════════════════════════════════════════════════════════╝"
+    )
+    _raw_cfg = load_or_create_config()
+    if _raw_cfg["provider"] == "deepseek":
+        ai = DeepSeekAPI(DeepSeekConfig(
+            api_key=_raw_cfg["api_key"],
+            base_url=_raw_cfg["base_url"],
+            model=_raw_cfg["model"],
+            prompt=_raw_cfg["prompt"],
+        ))
+    else:
+        ai = DusAPI(DusConfig(
+            api_key=_raw_cfg["api_key"],
+            base_url=_raw_cfg["base_url"],
+            model1=_raw_cfg["model"],
+            prompt=_raw_cfg["prompt"],
+        ))
+    asyncio.run(main())
