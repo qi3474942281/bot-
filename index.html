@@ -31,9 +31,24 @@
     textarea { resize: vertical; min-height: 120px; line-height: 1.6; }
     input:focus, textarea:focus { border-color: #64748b; }
     .save { width: 100%; margin-top: 28px; padding: 16px; border: 0; border-radius: 16px; color: #fff; background: #0f172a; font-size: 18px; }
-    .memory-row, .history-row { display: flex; gap: 12px; align-items: flex-start; margin: 10px 0; padding: 14px 16px; border: 1px solid #e2e8f0; border-radius: 15px; }
-    .memory-text, .history-text { flex: 1; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .history-meta { margin-bottom: 5px; color: #64748b; font-size: 13px; }
+    .memory-row { display: flex; gap: 12px; align-items: flex-start; margin: 10px 0; padding: 14px 16px; border: 1px solid #e2e8f0; border-radius: 15px; }
+    .memory-text { flex: 1; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .history-layout { display: grid; grid-template-columns: 190px minmax(0, 1fr); min-height: 480px; overflow: hidden; border: 1px solid #e2e8f0; border-radius: 18px; background: #fff; }
+    .history-dates { max-height: 620px; overflow-y: auto; padding: 14px; border-right: 1px solid #e2e8f0; background: #f8fafc; }
+    .history-date { display: block; width: 100%; margin-bottom: 8px; padding: 13px 14px; border: 1px solid transparent; border-radius: 13px; color: #475569; background: transparent; text-align: left; }
+    .history-date:hover { background: #eef2f7; }
+    .history-date.active { border-color: #0f172a; color: #fff; background: #0f172a; }
+    .history-date-main { display: block; font-size: 17px; font-weight: 700; }
+    .history-date-detail { display: block; margin-top: 4px; font-size: 12px; opacity: .75; }
+    .history-messages { min-width: 0; max-height: 620px; overflow-y: auto; padding: 22px; background: #f8fafc; }
+    .history-row { display: flex; margin: 14px 0; }
+    .history-row.user { justify-content: flex-end; }
+    .history-row.assistant { justify-content: flex-start; }
+    .history-message { max-width: min(76%, 680px); }
+    .history-meta { margin: 0 4px 6px; color: #64748b; font-size: 12px; }
+    .history-row.user .history-meta { text-align: right; }
+    .history-bubble { padding: 12px 16px; border: 1px solid #dbe3ee; border-radius: 6px 18px 18px 18px; background: #fff; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: 0 1px 2px rgba(15, 23, 42, .04); }
+    .history-row.user .history-bubble { border-color: #0f172a; border-radius: 18px 6px 18px 18px; color: #fff; background: #0f172a; }
     .connection { display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; margin-bottom: 28px; padding: 16px; border-radius: 16px; background: #f8fafc; }
     .connection input { padding: 10px 13px; border-radius: 10px; }
     #status { margin: 8px 0 0; color: #64748b; }
@@ -44,6 +59,11 @@
       .layout { grid-template-columns: 1fr; }
       .connection { grid-template-columns: 1fr; }
       .top { align-items: flex-start; flex-direction: column; }
+      .history-layout { grid-template-columns: 1fr; min-height: 420px; }
+      .history-dates { display: flex; gap: 8px; max-height: none; overflow-x: auto; padding: 12px; border-right: 0; border-bottom: 1px solid #e2e8f0; }
+      .history-date { flex: 0 0 132px; margin: 0; }
+      .history-messages { max-height: 560px; padding: 15px; }
+      .history-message { max-width: 88%; }
     }
   </style>
 </head>
@@ -111,6 +131,8 @@
   <script>
     let state = { activeCharacterId: null, characters: [] };
     let history = [];
+    let selectedHistoryDate = null;
+    let selectedHistoryCharacterId = null;
 
     const elements = Object.fromEntries(
       [...document.querySelectorAll("[id]")].map(element => [element.id, element])
@@ -248,16 +270,104 @@
     function renderHistory() {
       const character = activeCharacter();
       if (!character) return;
-      const rows = history.filter(item => item.character_id === character.id);
-      elements.historyList.className = "";
-      elements.historyList.innerHTML = rows.length ? rows.map(item => `
-        <div class="history-row">
-          <div class="history-text">
-            <div class="history-meta">${escapeHtml(item.created_at)} · ${item.role === "user" ? "用户" : "ClawBot"}</div>
-            ${escapeHtml(item.content)}
-          </div>
+      const rows = history
+        .filter(item => item.character_id === character.id)
+        .map(item => ({ ...item, date: historyDateParts(item.created_at) }));
+
+      if (!rows.length) {
+        selectedHistoryDate = null;
+        selectedHistoryCharacterId = character.id;
+        elements.historyList.className = "empty";
+        elements.historyList.innerHTML = "该人设还没有自动记录的对话。";
+        return;
+      }
+
+      const grouped = rows.reduce((result, item) => {
+        const key = item.date.key;
+        if (!result.has(key)) result.set(key, []);
+        result.get(key).push(item);
+        return result;
+      }, new Map());
+      const dates = [...grouped.keys()].sort((left, right) => right.localeCompare(left));
+
+      if (selectedHistoryCharacterId !== character.id || !grouped.has(selectedHistoryDate)) {
+        selectedHistoryDate = dates[0];
+      }
+      selectedHistoryCharacterId = character.id;
+
+      elements.historyList.className = "history-layout";
+      elements.historyList.innerHTML = `
+        <div class="history-dates" aria-label="聊天记录日期">
+          ${dates.map(key => {
+            const items = grouped.get(key);
+            const date = items[0].date;
+            return `
+              <button class="history-date ${key === selectedHistoryDate ? "active" : ""}"
+                      data-history-date="${escapeHtml(key)}">
+                <span class="history-date-main">${escapeHtml(date.label)}</span>
+                <span class="history-date-detail">${escapeHtml(date.weekday)} · ${items.length} 条消息</span>
+              </button>
+            `;
+          }).join("")}
         </div>
-      `).join("") : '<div class="empty">该人设还没有自动记录的对话。</div>';
+        <div class="history-messages">
+          ${historyMessages(grouped.get(selectedHistoryDate))}
+        </div>
+      `;
+      elements.historyList.querySelectorAll(".history-date").forEach(button => {
+        button.addEventListener("click", () => {
+          selectedHistoryDate = button.dataset.historyDate;
+          renderHistory();
+        });
+      });
+    }
+
+    function historyDateParts(value) {
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) {
+        return { key: "0000-00-00", label: "日期未知", weekday: "时间格式异常", time: "--:--" };
+      }
+      const parts = Object.fromEntries(
+        new Intl.DateTimeFormat("zh-CN", {
+          timeZone: "Asia/Shanghai",
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          weekday: "short",
+          hour: "2-digit",
+          minute: "2-digit",
+          hourCycle: "h23"
+        }).formatToParts(date).map(part => [part.type, part.value])
+      );
+      return {
+        key: `${parts.year}-${parts.month}-${parts.day}`,
+        label: `${parts.month}月${parts.day}日`,
+        weekday: parts.weekday,
+        time: `${parts.hour}:${parts.minute}`
+      };
+    }
+
+    function historyMessages(rows) {
+      return [...rows]
+        .sort((left, right) => {
+          const leftTime = Date.parse(left.created_at);
+          const rightTime = Date.parse(right.created_at);
+          if (Number.isNaN(leftTime) || Number.isNaN(rightTime)) {
+            return Number(left.id || 0) - Number(right.id || 0);
+          }
+          return leftTime - rightTime;
+        })
+        .map(item => {
+          const isUser = item.role === "user";
+          return `
+            <div class="history-row ${isUser ? "user" : "assistant"}">
+              <div class="history-message">
+                <div class="history-meta">${isUser ? "用户" : "ClawBot"} · ${escapeHtml(item.date.time)}</div>
+                <div class="history-bubble">${escapeHtml(item.content)}</div>
+              </div>
+            </div>
+          `;
+        }).join("");
     }
 
     async function addCharacter() {
