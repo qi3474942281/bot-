@@ -1,13 +1,26 @@
 {
-  "default_model": "gemini",
-  "current_model": "gpt5.5",
+  "default_model": "claude-opus-4-8",
+  "current_model": "claude-opus-4-8",
   "models": {
     "gemini": {
+      "provider": "deepseek",
       "model": "[按量]gemini-3-flash-preview"
     },
     "gpt5.5": {
+      "provider": "deepseek",
       "model": "gpt-5.5"
+    },
+    "claude-opus-4-8": {
+      "provider": "packy",
+      "model": "claude-opus-4-8"
+    },
+    "claude-opus-4-7": {
+      "provider": "packy",
+      "model": "claude-opus-4-7"
+    },
+    "claude-opus-4-6": {
+      "provider": "packy",
+      "model": "claude-opus-4-6"
     }
   }
 }
-

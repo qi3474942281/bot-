@@ -57,6 +57,12 @@ PROVIDERS = {
         "model": "deepseek-v4-flash",
         "prompt": _DEFAULT_PROMPT,
     },
+    "packy": {
+        "label": "Packy API",
+        "base_url": "https://www.packyapi.com/v1",
+        "model": "claude-opus-4-8",
+        "prompt": _DEFAULT_PROMPT,
+    },
 }
 
 
@@ -82,6 +88,42 @@ def get_active_model_name() -> str | None:
     if not active_key:
         return None
     return models.get(active_key, {}).get("model")
+
+
+def resolve_model_runtime(model_key: str | None = None) -> dict:
+    cfg = load_config_file()
+    models = cfg.get("models") or {}
+    if model_key is None:
+        model_key = get_active_model_key()
+    profile = models.get(model_key or "", {}) if isinstance(models, dict) else {}
+    provider = profile.get("provider") or cfg.get("provider") or "dusapi"
+    provider_cfg = dict((cfg.get("providers") or {}).get(provider) or {})
+    defaults = PROVIDERS.get(provider, PROVIDERS["dusapi"])
+
+    return {
+        "provider": provider,
+        "api_key": profile.get("api_key") or provider_cfg.get("api_key", ""),
+        "base_url": profile.get("base_url") or provider_cfg.get("base_url") or defaults["base_url"],
+        "model": profile.get("model") or provider_cfg.get("model") or defaults["model"],
+        "prompt": profile.get("prompt") or provider_cfg.get("prompt") or defaults["prompt"],
+    }
+
+
+def create_ai_client(runtime: dict):
+    provider = runtime.get("provider", "dusapi")
+    if provider == "dusapi":
+        return DusAPI(DusConfig(
+            api_key=runtime["api_key"],
+            base_url=runtime["base_url"],
+            model1=runtime["model"],
+            prompt=runtime["prompt"],
+        ))
+    return DeepSeekAPI(DeepSeekConfig(
+        api_key=runtime["api_key"],
+        base_url=runtime["base_url"],
+        model=runtime["model"],
+        prompt=runtime["prompt"],
+    ))
 
 
 def save_active_model_key(model_key: str):
@@ -287,13 +329,14 @@ def run_memory_summary(task):
     profiles = get_model_profiles()
     if model_key not in profiles:
         model_key = get_active_model_key()
-    model_name = profiles.get(model_key, {}).get("model")
+    runtime = resolve_model_runtime(model_key)
+    summary_ai = create_ai_client(runtime)
     last_error = None
     for attempt in range(2):
         prompt = _summary_prompt(task, last_error)
-        raw = ai.chat(
+        raw = summary_ai.chat(
             prompt,
-            model=model_name,
+            model=runtime["model"],
             prompt="你是 ClawBot 的结构化记忆引擎。严格遵循用户要求，只输出指定 JSON。",
             history=None,
         )
@@ -980,15 +1023,17 @@ async def main():
                 loop = asyncio.get_event_loop()
                 # 或者替换为你自已要用的接口
                 character_id = clawbot_store.active_character()["id"]
-                active_model = get_active_model_name()
-                active_prompt = clawbot_store.build_prompt(_raw_cfg["prompt"])
+                active_model_key = get_active_model_key()
+                active_runtime = resolve_model_runtime(active_model_key)
+                active_ai = create_ai_client(active_runtime)
+                active_prompt = clawbot_store.build_prompt(active_runtime["prompt"])
                 recent_history = clawbot_store.recent_history(from_id)
                 reply = await loop.run_in_executor(
                     executor,
                     partial(
-                        ai.chat,
+                        active_ai.chat,
                         text,
-                        model=active_model,
+                        model=active_runtime["model"],
                         prompt=active_prompt,
                         history=recent_history,
                     ),
@@ -1055,18 +1100,5 @@ if __name__ == "__main__":
         "╚══════════════════════════════════════════════════════════╝"
     )
     _raw_cfg = load_or_create_config()
-    if _raw_cfg["provider"] == "deepseek":
-        ai = DeepSeekAPI(DeepSeekConfig(
-            api_key=_raw_cfg["api_key"],
-            base_url=_raw_cfg["base_url"],
-            model=_raw_cfg["model"],
-            prompt=_raw_cfg["prompt"],
-        ))
-    else:
-        ai = DusAPI(DusConfig(
-            api_key=_raw_cfg["api_key"],
-            base_url=_raw_cfg["base_url"],
-            model1=_raw_cfg["model"],
-            prompt=_raw_cfg["prompt"],
-        ))
+    ai = create_ai_client(_raw_cfg)
     asyncio.run(main())
