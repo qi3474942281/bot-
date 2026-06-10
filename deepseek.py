@@ -68,6 +68,12 @@ class DeepSeekAPI:
         for attempt in range(max_retries + 1):
             try:
                 response = requests.post(endpoint, headers=headers, json=payload, timeout=60)
+                if response.status_code >= 400:
+                    error_text = response.text[:500].replace("\n", " ")
+                    log(
+                        f"DeepSeekAPI HTTP {response.status_code} from {endpoint}: {error_text}",
+                        "ERROR",
+                    )
                 response.raise_for_status()
                 data = response.json()
                 result = data["choices"][0]["message"].get("content", "")
@@ -90,4 +96,4 @@ class DeepSeekAPI:
                 else:
                     log(f"DeepSeekAPI 已重试 {max_retries} 次，最终失败: {last_error}", "ERROR")
 
-        return "API接口失效，请联系管理员"
+        return f"API接口失效，请联系管理员：{last_error}"
