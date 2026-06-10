@@ -387,7 +387,7 @@ def load_config_file() -> dict:
     if not os.path.exists(CONFIG_FILE):
         return {"provider": "dusapi", "providers": {}}
 
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+    with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
         cfg = json.load(f)
 
     # 兼容旧版扁平配置：{api_key, base_url, model, prompt}

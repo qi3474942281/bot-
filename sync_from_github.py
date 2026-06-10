@@ -23,7 +23,7 @@ def sync_public_settings() -> bool:
         with urllib.request.urlopen(request, timeout=10) as response:
             remote = json.load(response)
 
-        with open(CONFIG_FILE, "r", encoding="utf-8") as file:
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as file:
             local = json.load(file)
 
         models = remote.get("models")
