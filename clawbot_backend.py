@@ -4,7 +4,7 @@ import os
 import secrets
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from aiohttp import web
 
@@ -40,6 +40,29 @@ DEFAULT_MEMORY_PROGRESS = {
     "lastError": "",
     "lastRoundMessageId": 0,
 }
+CHINA_TZ = timezone(timedelta(hours=8))
+PROACTIVE_MODES = {
+    "exact",
+    "random_1_30",
+    "random_30_60",
+    "random_60_120",
+    "random_120_180",
+    "random_180_240",
+    "random_240_300",
+    "random_1_300",
+}
+DEFAULT_PROACTIVE_CONFIG = {
+    "enabled": False,
+    "mode": "random_60_120",
+    "exactMinutes": 60,
+    "windowStart": "08:00",
+    "windowEnd": "23:00",
+}
+DEFAULT_PROACTIVE_PROGRESS = {
+    "nextSendAt": "",
+    "lastSentAt": "",
+    "lastError": "",
+}
 
 
 class VersionConflict(ValueError):
@@ -72,6 +95,90 @@ def _int_setting(value, default, minimum, maximum):
     except (TypeError, ValueError):
         result = default
     return max(minimum, min(result, maximum))
+
+
+def _time_setting(value, default):
+    text = str(value or "")
+    try:
+        parsed = datetime.strptime(text, "%H:%M")
+    except ValueError:
+        return default
+    return parsed.strftime("%H:%M")
+
+
+def _normalize_proactive_config(value) -> dict:
+    raw = value if isinstance(value, dict) else {}
+    mode = _clean_text(raw.get("mode"), 30)
+    if mode not in PROACTIVE_MODES:
+        mode = DEFAULT_PROACTIVE_CONFIG["mode"]
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "mode": mode,
+        "exactMinutes": _int_setting(raw.get("exactMinutes"), 60, 1, 1440),
+        "windowStart": _time_setting(raw.get("windowStart"), "08:00"),
+        "windowEnd": _time_setting(raw.get("windowEnd"), "23:00"),
+    }
+
+
+def _normalize_proactive_progress(value) -> dict:
+    raw = value if isinstance(value, dict) else {}
+    return {
+        "nextSendAt": _clean_text(raw.get("nextSendAt"), 80),
+        "lastSentAt": _clean_text(raw.get("lastSentAt"), 80),
+        "lastError": _clean_text(raw.get("lastError"), 1000),
+    }
+
+
+def _parse_utc(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _window_bounds(now_utc, config):
+    local_now = now_utc.astimezone(CHINA_TZ)
+    start_time = datetime.strptime(config["windowStart"], "%H:%M").time()
+    end_time = datetime.strptime(config["windowEnd"], "%H:%M").time()
+    start = datetime.combine(local_now.date(), start_time, CHINA_TZ)
+    end = datetime.combine(local_now.date(), end_time, CHINA_TZ)
+    if start_time == end_time:
+        return local_now, local_now + timedelta(days=1)
+    if start_time < end_time:
+        if local_now < start:
+            return start, end
+        if local_now >= end:
+            return start + timedelta(days=1), end + timedelta(days=1)
+        return start, end
+    if local_now >= start:
+        return start, end + timedelta(days=1)
+    if local_now < end:
+        return start - timedelta(days=1), end
+    return start, end + timedelta(days=1)
+
+
+def proactive_allowed_at(moment_utc, config):
+    local = moment_utc.astimezone(CHINA_TZ)
+    start = datetime.strptime(config["windowStart"], "%H:%M").time()
+    end = datetime.strptime(config["windowEnd"], "%H:%M").time()
+    current = local.time().replace(second=0, microsecond=0)
+    if start == end:
+        return True
+    if start < end:
+        return start <= current < end
+    return current >= start or current < end
+
+
+def defer_to_proactive_window(moment_utc, config):
+    if proactive_allowed_at(moment_utc, config):
+        return moment_utc
+    start, _ = _window_bounds(moment_utc, config)
+    return start.astimezone(timezone.utc)
 
 
 def _normalize_memory_config(value) -> dict:
@@ -178,6 +285,7 @@ class ClawBotStore:
                     user_id TEXT NOT NULL,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
+                    count_for_memory INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS memory_profiles (
@@ -202,8 +310,23 @@ class ClawBotStore:
                 );
                 CREATE INDEX IF NOT EXISTS memory_entries_character_kind
                 ON memory_entries(character_id, kind, sequence_no, id);
+                CREATE TABLE IF NOT EXISTS proactive_profiles (
+                    character_id TEXT PRIMARY KEY,
+                    config_json TEXT NOT NULL,
+                    progress_json TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
+            message_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(messages)").fetchall()
+            }
+            if "count_for_memory" not in message_columns:
+                connection.execute(
+                    "ALTER TABLE messages ADD COLUMN count_for_memory INTEGER NOT NULL DEFAULT 1"
+                )
             existing = connection.execute(
                 "SELECT 1 FROM settings WHERE key = 'state'"
             ).fetchone()
@@ -275,6 +398,24 @@ class ClawBotStore:
                     "UPDATE memory_profiles SET migrated = 1 WHERE character_id = ?",
                     (character["id"],),
                 )
+            proactive = connection.execute(
+                "SELECT 1 FROM proactive_profiles WHERE character_id = ?",
+                (character["id"],),
+            ).fetchone()
+            if not proactive:
+                connection.execute(
+                    """
+                    INSERT INTO proactive_profiles(
+                        character_id, config_json, progress_json, version, updated_at
+                    ) VALUES(?, ?, ?, 1, ?)
+                    """,
+                    (
+                        character["id"],
+                        json.dumps(DEFAULT_PROACTIVE_CONFIG, ensure_ascii=False),
+                        json.dumps(DEFAULT_PROACTIVE_PROGRESS, ensure_ascii=False),
+                        now,
+                    ),
+                )
 
     def get_state(self) -> dict:
         with self.lock, self._connect() as connection:
@@ -303,6 +444,139 @@ class ClawBotStore:
             for item in state["characters"]
             if item["id"] == state["activeCharacterId"]
         )
+
+    def proactive_snapshot(self, character_id: str) -> dict:
+        with self.lock, self._connect() as connection:
+            self._ensure_profiles(connection, self._state_from_connection(connection))
+            row = connection.execute(
+                "SELECT * FROM proactive_profiles WHERE character_id = ?",
+                (character_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("character proactive profile not found")
+            config = dict(DEFAULT_PROACTIVE_CONFIG)
+            config.update(json.loads(row["config_json"]))
+            progress = dict(DEFAULT_PROACTIVE_PROGRESS)
+            progress.update(json.loads(row["progress_json"]))
+        return {
+            "characterId": character_id,
+            "config": _normalize_proactive_config(config),
+            "progress": _normalize_proactive_progress(progress),
+            "version": row["version"],
+        }
+
+    def save_proactive_config(self, character_id, value, expected_version) -> dict:
+        config = _normalize_proactive_config(value)
+        now = datetime.now(timezone.utc)
+        with self.lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM proactive_profiles WHERE character_id = ?",
+                (character_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("character proactive profile not found")
+            if expected_version is None or int(expected_version) != row["version"]:
+                raise VersionConflict("主动消息设置已更新，请刷新后重试")
+            old_config = _normalize_proactive_config(json.loads(row["config_json"]))
+            progress = _normalize_proactive_progress(json.loads(row["progress_json"]))
+            if old_config["enabled"] and not config["enabled"]:
+                progress["nextSendAt"] = ""
+                progress["lastError"] = ""
+            elif not old_config["enabled"] and config["enabled"]:
+                progress["nextSendAt"] = ""
+                progress["lastError"] = ""
+            connection.execute(
+                """
+                UPDATE proactive_profiles
+                SET config_json = ?, progress_json = ?, version = version + 1,
+                    updated_at = ?
+                WHERE character_id = ?
+                """,
+                (
+                    json.dumps(config, ensure_ascii=False),
+                    json.dumps(progress, ensure_ascii=False),
+                    now.isoformat(),
+                    character_id,
+                ),
+            )
+        return self.proactive_snapshot(character_id)
+
+    def set_proactive_schedule(self, character_id, next_send_at) -> dict:
+        with self.lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT progress_json FROM proactive_profiles WHERE character_id = ?",
+                (character_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("character proactive profile not found")
+            progress = _normalize_proactive_progress(json.loads(row["progress_json"]))
+            progress["nextSendAt"] = (
+                next_send_at.astimezone(timezone.utc).isoformat()
+                if next_send_at
+                else ""
+            )
+            connection.execute(
+                """
+                UPDATE proactive_profiles SET progress_json = ?, updated_at = ?
+                WHERE character_id = ?
+                """,
+                (
+                    json.dumps(progress, ensure_ascii=False),
+                    datetime.now(timezone.utc).isoformat(),
+                    character_id,
+                ),
+            )
+        return self.proactive_snapshot(character_id)
+
+    def mark_proactive_sent(self, character_id, next_send_at, sent_at=None):
+        sent_at = sent_at or datetime.now(timezone.utc)
+        with self.lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT progress_json FROM proactive_profiles WHERE character_id = ?",
+                (character_id,),
+            ).fetchone()
+            progress = _normalize_proactive_progress(json.loads(row["progress_json"]))
+            progress.update(
+                {
+                    "nextSendAt": next_send_at.astimezone(timezone.utc).isoformat(),
+                    "lastSentAt": sent_at.astimezone(timezone.utc).isoformat(),
+                    "lastError": "",
+                }
+            )
+            connection.execute(
+                "UPDATE proactive_profiles SET progress_json = ?, updated_at = ? WHERE character_id = ?",
+                (
+                    json.dumps(progress, ensure_ascii=False),
+                    sent_at.astimezone(timezone.utc).isoformat(),
+                    character_id,
+                ),
+            )
+
+    def mark_proactive_error(self, character_id, message, retry_at):
+        with self.lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT progress_json FROM proactive_profiles WHERE character_id = ?",
+                (character_id,),
+            ).fetchone()
+            progress = _normalize_proactive_progress(json.loads(row["progress_json"]))
+            progress["lastError"] = _clean_text(message, 1000)
+            progress["nextSendAt"] = retry_at.astimezone(timezone.utc).isoformat()
+            connection.execute(
+                "UPDATE proactive_profiles SET progress_json = ?, updated_at = ? WHERE character_id = ?",
+                (
+                    json.dumps(progress, ensure_ascii=False),
+                    datetime.now(timezone.utc).isoformat(),
+                    character_id,
+                ),
+            )
+
+    def proactive_due(self, character_id, now=None):
+        now = now or datetime.now(timezone.utc)
+        snapshot = self.proactive_snapshot(character_id)
+        if not snapshot["config"]["enabled"]:
+            return False
+        next_send = _parse_utc(snapshot["progress"]["nextSendAt"])
+        return bool(next_send and next_send <= now)
 
     def _profile(self, connection, character_id):
         row = connection.execute(
@@ -546,20 +820,24 @@ class ClawBotStore:
             )
         return "\n\n".join(section for section in sections if section)
 
-    def add_message(self, user_id: str, role: str, content: str):
+    def add_message(
+        self, user_id: str, role: str, content: str, count_for_memory: bool = True
+    ):
         character = self.active_character()
         now = datetime.now(timezone.utc).isoformat()
         with self.lock, self._connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO messages(character_id, user_id, role, content, created_at)
-                VALUES(?, ?, ?, ?, ?)
+                INSERT INTO messages(
+                    character_id, user_id, role, content, count_for_memory, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
                 """,
                 (
                     character["id"],
                     _clean_text(user_id, 200),
                     role,
                     _clean_text(content, 20000),
+                    1 if count_for_memory else 0,
                     now,
                 ),
             )
@@ -599,7 +877,10 @@ class ClawBotStore:
 
     def _latest_message_id(self, connection, character_id):
         return connection.execute(
-            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE character_id = ?",
+            """
+            SELECT COALESCE(MAX(id), 0) FROM messages
+            WHERE character_id = ? AND count_for_memory = 1
+            """,
             (character_id,),
         ).fetchone()[0]
 
@@ -1019,6 +1300,28 @@ def create_api_app(store: ClawBotStore, config: dict, model_loader=None) -> web.
         except (ValueError, TypeError) as error:
             return web.json_response({"error": str(error)}, status=400)
 
+    async def get_proactive(request):
+        try:
+            return web.json_response(
+                store.proactive_snapshot(request.match_info["character_id"])
+            )
+        except ValueError as error:
+            return web.json_response({"error": str(error)}, status=404)
+
+    async def put_proactive(request):
+        try:
+            body = await request.json()
+            result = store.save_proactive_config(
+                request.match_info["character_id"],
+                body.get("config"),
+                body.get("version"),
+            )
+            return web.json_response(result)
+        except VersionConflict as error:
+            return web.json_response({"error": str(error)}, status=409)
+        except (json.JSONDecodeError, ValueError, TypeError) as error:
+            return web.json_response({"error": str(error)}, status=400)
+
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/state", get_state)
     app.router.add_put("/api/state", put_state)
@@ -1031,6 +1334,8 @@ def create_api_app(store: ClawBotStore, config: dict, model_loader=None) -> web.
     app.router.add_delete(
         "/api/memory/{character_id}/entries/{entry_id}", delete_memory_entry
     )
+    app.router.add_get("/api/proactive/{character_id}", get_proactive)
+    app.router.add_put("/api/proactive/{character_id}", put_proactive)
     return app
 
 

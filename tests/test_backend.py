@@ -1,8 +1,14 @@
 import unittest
+from datetime import datetime, timezone
 
 from aiohttp.test_utils import TestClient, TestServer
 
-from clawbot_backend import ClawBotStore, create_api_app
+from clawbot_backend import (
+    ClawBotStore,
+    create_api_app,
+    defer_to_proactive_window,
+    proactive_allowed_at,
+)
 
 
 class BackendTests(unittest.IsolatedAsyncioTestCase):
@@ -300,6 +306,88 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                     [item["content"] for item in task["messages"]],
                     ["新问题", "新回答"],
                 )
+
+    async def test_proactive_config_api_and_version_conflict(self):
+        response = await self.client.get(
+            "/api/proactive/default", headers=self.headers
+        )
+        self.assertEqual(response.status, 200)
+        snapshot = await response.json()
+        config = dict(snapshot["config"])
+        config.update(
+            {
+                "enabled": True,
+                "mode": "exact",
+                "exactMinutes": 15,
+                "windowStart": "09:00",
+                "windowEnd": "22:30",
+            }
+        )
+        response = await self.client.put(
+            "/api/proactive/default",
+            headers=self.headers,
+            json={"config": config, "version": snapshot["version"]},
+        )
+        self.assertEqual(response.status, 200)
+        updated = await response.json()
+        self.assertTrue(updated["config"]["enabled"])
+        self.assertEqual(updated["config"]["exactMinutes"], 15)
+        self.assertEqual(updated["progress"]["nextSendAt"], "")
+
+        response = await self.client.put(
+            "/api/proactive/default",
+            headers=self.headers,
+            json={"config": config, "version": snapshot["version"]},
+        )
+        self.assertEqual(response.status, 409)
+
+    async def test_proactive_schedule_and_non_counting_message(self):
+        snapshot = self.store.proactive_snapshot("default")
+        config = dict(snapshot["config"])
+        config["enabled"] = True
+        self.store.save_proactive_config(
+            "default", config, snapshot["version"]
+        )
+        due = datetime(2026, 6, 14, 4, 0, tzinfo=timezone.utc)
+        self.store.set_proactive_schedule("default", due)
+        self.assertTrue(
+            self.store.proactive_due(
+                "default", datetime(2026, 6, 14, 4, 1, tzinfo=timezone.utc)
+            )
+        )
+        self.store.add_message(
+            "user-1", "assistant", "主动问候", count_for_memory=False
+        )
+        self.assertEqual(self.store.prepare_memory_tasks("default", "user-1"), [])
+        self.assertEqual(
+            self.store.memory_snapshot("default")["progress"]["factRounds"], 0
+        )
+
+    async def test_proactive_china_time_window_including_overnight(self):
+        daytime = {"windowStart": "08:00", "windowEnd": "23:00"}
+        before = datetime(2026, 6, 13, 23, 30, tzinfo=timezone.utc)
+        deferred = defer_to_proactive_window(before, daytime)
+        self.assertEqual(
+            deferred, datetime(2026, 6, 14, 0, 0, tzinfo=timezone.utc)
+        )
+        self.assertFalse(proactive_allowed_at(before, daytime))
+        self.assertTrue(
+            proactive_allowed_at(
+                datetime(2026, 6, 14, 2, 0, tzinfo=timezone.utc), daytime
+            )
+        )
+
+        overnight = {"windowStart": "22:00", "windowEnd": "06:00"}
+        self.assertTrue(
+            proactive_allowed_at(
+                datetime(2026, 6, 14, 15, 0, tzinfo=timezone.utc), overnight
+            )
+        )
+        self.assertFalse(
+            proactive_allowed_at(
+                datetime(2026, 6, 14, 4, 0, tzinfo=timezone.utc), overnight
+            )
+        )
 
 
 if __name__ == "__main__":

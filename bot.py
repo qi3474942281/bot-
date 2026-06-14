@@ -8,13 +8,19 @@ import re
 import aiohttp
 import time
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 from dusapi import DusAPI, DusConfig
 from deepseek import DeepSeekAPI, DeepSeekConfig
 from sync_from_github import sync_public_settings
-from clawbot_backend import ClawBotStore, start_backend
+from clawbot_backend import (
+    ClawBotStore,
+    defer_to_proactive_window,
+    proactive_allowed_at,
+    start_backend,
+)
 
 executor = ThreadPoolExecutor(max_workers=4)
 ai = None  # 启动时从配置文件加载后初始化
@@ -587,6 +593,151 @@ async def send_msg_safe(session, to_id, context_token, text, bot_token_ref, bot_
         print(f"[重连通知] 发送失败({e})，降级打印: {text}")
 
 
+PROACTIVE_INTERVALS = {
+    "random_1_30": (1, 30),
+    "random_30_60": (30, 60),
+    "random_60_120": (60, 120),
+    "random_120_180": (120, 180),
+    "random_180_240": (180, 240),
+    "random_240_300": (240, 300),
+    "random_1_300": (1, 300),
+}
+
+
+def next_proactive_time(config, now=None):
+    now = now or datetime.now(timezone.utc)
+    if config["mode"] == "exact":
+        minutes = config["exactMinutes"]
+    else:
+        minimum, maximum = PROACTIVE_INTERVALS.get(
+            config["mode"], PROACTIVE_INTERVALS["random_60_120"]
+        )
+        minutes = random.randint(minimum, maximum)
+    return defer_to_proactive_window(now + timedelta(minutes=minutes), config)
+
+
+def generate_proactive_message(user_id):
+    runtime = resolve_model_runtime(get_active_model_key())
+    proactive_ai = create_ai_client(runtime)
+    prompt = clawbot_store.build_prompt(runtime["prompt"])
+    prompt += (
+        "\n\n【主动消息要求】\n"
+        "现在请你自然地主动开启一段对话。结合人物设定、记忆和最近聊天，"
+        "发送一条简短、具体、像真人自然想起对方时会说的话。"
+        "不要提及定时、系统、任务、频率或主动消息设置，不要重复最近已经说过的话。"
+    )
+    return proactive_ai.chat(
+        "请根据当前关系和上下文，生成一条现在适合主动发给用户的消息。",
+        model=runtime["model"],
+        prompt=prompt,
+        history=clawbot_store.recent_history(user_id),
+    )
+
+
+async def send_proactive_message(
+    session, to_id, context_token, text, bot_token_ref, bot_base_url_ref
+):
+    client_id = f"openclaw-weixin-{random.randint(0, 0xFFFFFFFF):08x}"
+    result = await api_post(
+        session,
+        "ilink/bot/sendmessage",
+        {
+            "msg": {
+                "from_user_id": "",
+                "to_user_id": to_id,
+                "client_id": client_id,
+                "message_type": 2,
+                "message_state": 2,
+                "context_token": context_token,
+                "item_list": [{"type": 1, "text_item": {"text": text}}],
+            },
+            "base_info": base_info(),
+        },
+        bot_token_ref[0],
+        bot_base_url_ref[0] or None,
+    )
+    if isinstance(result, dict) and result.get("errcode") not in (None, 0):
+        raise RuntimeError(result.get("errmsg") or f"微信接口错误 {result['errcode']}")
+
+
+async def proactive_message_task(
+    session, bot_token_ref, bot_base_url_ref, last_contact
+):
+    while True:
+        await asyncio.sleep(10)
+        try:
+            character_id = clawbot_store.active_character()["id"]
+            snapshot = clawbot_store.proactive_snapshot(character_id)
+            config = snapshot["config"]
+            if not config["enabled"]:
+                continue
+            if not last_contact["from_id"] or not last_contact["context_token"]:
+                continue
+
+            now = datetime.now(timezone.utc)
+            next_send = None
+            if snapshot["progress"]["nextSendAt"]:
+                try:
+                    next_send = datetime.fromisoformat(
+                        snapshot["progress"]["nextSendAt"].replace("Z", "+00:00")
+                    ).astimezone(timezone.utc)
+                except ValueError:
+                    pass
+            if next_send is None:
+                clawbot_store.set_proactive_schedule(
+                    character_id, next_proactive_time(config, now)
+                )
+                continue
+            if next_send > now:
+                continue
+            if not proactive_allowed_at(now, config):
+                clawbot_store.set_proactive_schedule(
+                    character_id, defer_to_proactive_window(now, config)
+                )
+                continue
+
+            loop = asyncio.get_running_loop()
+            reply = await loop.run_in_executor(
+                executor, partial(generate_proactive_message, last_contact["from_id"])
+            )
+            reply = str(reply or "").strip()
+            if not reply:
+                raise ValueError("主动消息模型返回空内容")
+            if clawbot_store.active_character()["id"] != character_id:
+                continue
+            await send_proactive_message(
+                session,
+                last_contact["from_id"],
+                last_contact["context_token"],
+                reply,
+                bot_token_ref,
+                bot_base_url_ref,
+            )
+            clawbot_store.add_message(
+                last_contact["from_id"],
+                "assistant",
+                reply,
+                count_for_memory=False,
+            )
+            clawbot_store.mark_proactive_sent(
+                character_id, next_proactive_time(config, now), now
+            )
+            print(f"[主动消息] 已发送：{reply[:50]}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(f"[主动消息] 失败：{error}")
+            try:
+                character_id = clawbot_store.active_character()["id"]
+                clawbot_store.mark_proactive_error(
+                    character_id,
+                    str(error),
+                    datetime.now(timezone.utc) + timedelta(minutes=5),
+                )
+            except Exception as store_error:
+                print(f"[主动消息] 无法记录失败状态：{store_error}")
+
+
 async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
                        typing_ticket_cache, reconnect_asked, warning_active,
                        reconnect_in_progress, login_time_ref, cfg):
@@ -943,7 +1094,13 @@ async def login_with_qrcode(session, base_url=BASE_URL):
 
 
 async def main():
-    await start_backend(clawbot_store, model_loader=get_model_profiles)
+    try:
+        await start_backend(clawbot_store, model_loader=get_model_profiles)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 10048:
+            print("ClawBot backend port is already in use; continuing with the existing backend.")
+        else:
+            raise
     async with aiohttp.ClientSession() as session:
         # 1. 获取二维码并等待扫码
         login_result = await login_with_qrcode(session)
@@ -954,6 +1111,12 @@ async def main():
         bot_token_ref = [bot_token]
         bot_base_url_ref = [bot_base_url]
         typing_ticket_cache = {}
+        last_contact = {"from_id": "", "context_token": ""}
+        asyncio.create_task(
+            proactive_message_task(
+                session, bot_token_ref, bot_base_url_ref, last_contact
+            )
+        )
 
         # 4. 长轮询收消息
         get_updates_buf = ""
@@ -974,6 +1137,8 @@ async def main():
                 text = msg.get("item_list", [{}])[0].get("text_item", {}).get("text", "")
                 from_id = msg["from_user_id"]
                 context_token = msg["context_token"]
+                last_contact["from_id"] = from_id
+                last_contact["context_token"] = context_token
                 print(f"收到消息: {text}")
 
                 is_model_command, model_reply = handle_model_command(text)
