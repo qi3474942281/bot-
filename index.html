@@ -76,6 +76,15 @@
     .general-note { margin: 0 0 18px; padding: 14px 16px; border-radius: 13px; color: #475569; background: #f1f5f9; line-height: 1.6; }
     .general-status { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
     .general-status .stat-card { min-height: 76px; }
+    .affection-value { display: flex; align-items: baseline; gap: 8px; margin-bottom: 16px; }
+    .affection-value strong { font-size: 42px; color: #0f172a; }
+    .affection-progress { height: 14px; margin-bottom: 20px; overflow: hidden; border-radius: 999px; background: #e2e8f0; }
+    .affection-progress span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #f472b6, #ec4899); }
+    .affection-controls { display: grid; grid-template-columns: 1fr 140px; gap: 14px; align-items: center; }
+    .affection-history { display: grid; gap: 10px; margin-top: 24px; }
+    .affection-history-row { padding: 13px 15px; border: 1px solid #e2e8f0; border-radius: 13px; background: #fff; }
+    .affection-history-row strong.positive { color: #16a34a; }
+    .affection-history-row strong.negative { color: #dc2626; }
     .connection { display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; margin-bottom: 28px; padding: 16px; border-radius: 16px; background: #f8fafc; }
     .connection input { padding: 10px 13px; border-radius: 10px; }
     #status { margin: 8px 0 0; color: #64748b; }
@@ -95,7 +104,7 @@
       .memory-nav { display: flex; gap: 8px; overflow-x: auto; border-right: 0; border-bottom: 1px solid #e2e8f0; }
       .memory-nav-button { flex: 0 0 142px; margin: 0; }
       .memory-content { padding: 16px; }
-      .settings-grid, .overview-stats, .general-status { grid-template-columns: 1fr; }
+      .settings-grid, .overview-stats, .general-status, .affection-controls { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -148,7 +157,8 @@
         <div class="panel" id="memory">
           <div class="memory-layout">
             <nav class="memory-nav" id="memoryNav">
-              <button class="memory-nav-button active" data-memory-section="facts">记住的事</button>
+              <button class="memory-nav-button active" data-memory-section="affection">好感度</button>
+              <button class="memory-nav-button" data-memory-section="facts">记住的事</button>
               <button class="memory-nav-button" data-memory-section="rules">必须遵守的规则</button>
               <button class="memory-nav-button" data-memory-section="settings">记忆设置</button>
               <button class="memory-nav-button" data-memory-section="overview">记忆总览</button>
@@ -173,7 +183,9 @@
     let selectedHistoryCharacterId = null;
     let memoryData = null;
     let proactiveData = null;
-    let selectedMemorySection = "facts";
+    let generalData = null;
+    let affectionData = null;
+    let selectedMemorySection = "affection";
 
     const elements = Object.fromEntries(
       [...document.querySelectorAll("[id]")].map(element => [element.id, element])
@@ -228,6 +240,8 @@
         history = result.history || [];
         await loadMemory();
         await loadProactive();
+        await loadGeneral();
+        await loadAffection();
         renderAll();
         setStatus("已连接云电脑，页面数据来自 ClawBot 后端。", "ok");
       } catch (error) {
@@ -244,6 +258,8 @@
         state = result.state;
         await loadMemory();
         await loadProactive();
+        await loadGeneral();
+        await loadAffection();
         renderAll();
         setStatus(message, "ok");
       } catch (error) {
@@ -301,6 +317,18 @@
       proactiveData = await api(`/api/proactive/${encodeURIComponent(character.id)}`);
     }
 
+    async function loadGeneral() {
+      const character = activeCharacter();
+      if (!character) return;
+      generalData = await api(`/api/general/${encodeURIComponent(character.id)}`);
+    }
+
+    async function loadAffection() {
+      const character = activeCharacter();
+      if (!character) return;
+      affectionData = await api(`/api/affection/${encodeURIComponent(character.id)}`);
+    }
+
     function proactiveModeLabel(config) {
       const labels = {
         exact: `精确每 ${config.exactMinutes} 分钟`,
@@ -331,9 +359,17 @@
 
     function renderGeneralSettings() {
       const character = activeCharacter();
-      if (!character || !proactiveData || proactiveData.characterId !== character.id) return;
+      if (!character || !proactiveData || !generalData ||
+          proactiveData.characterId !== character.id ||
+          generalData.characterId !== character.id) return;
       const config = proactiveData.config;
       const progress = proactiveData.progress;
+      const general = generalData.config;
+      const modelOptions = Object.entries(generalData.models || {}).map(([key, value]) => `
+        <option value="${escapeHtml(key)}" ${general.currentModel === key ? "selected" : ""}>
+          ${escapeHtml(key)} · ${escapeHtml(value.model || "")}
+        </option>
+      `).join("");
       elements.generalContent.className = "";
       elements.generalContent.innerHTML = `
         <div class="memory-section-header"><h3>通用设置</h3></div>
@@ -346,6 +382,14 @@
           <div class="stat-card">下次计划<strong>${config.enabled ? escapeHtml(formatChinaTime(progress.nextSendAt)) : "未启用"}</strong></div>
         </div>
         <div class="settings-grid">
+          <div class="setting-card">
+            <label for="chatModel">当前人物聊天模型</label>
+            <select id="chatModel">${modelOptions}</select>
+          </div>
+          <div class="setting-card">
+            <label for="mergeWaitSeconds">连续消息合并等待（秒）</label>
+            <input id="mergeWaitSeconds" type="number" min="1" max="30" value="${general.mergeWaitSeconds}">
+          </div>
           <div class="setting-card switch-row"><label for="proactiveEnabled">主动消息</label><input id="proactiveEnabled" type="checkbox" ${config.enabled ? "checked" : ""}></div>
           <div class="setting-card">
             <label for="proactiveMode">主动消息频率</label>
@@ -377,6 +421,11 @@
     }
 
     async function saveGeneralSettings() {
+      const generalConfig = {
+        ...generalData.config,
+        currentModel: document.getElementById("chatModel").value,
+        mergeWaitSeconds: Number(document.getElementById("mergeWaitSeconds").value)
+      };
       const config = {
         ...proactiveData.config,
         enabled: document.getElementById("proactiveEnabled").checked,
@@ -389,6 +438,10 @@
         method: "PUT",
         body: JSON.stringify({ config, version: proactiveData.version })
       });
+      generalData = await api(`/api/general/${encodeURIComponent(activeCharacter().id)}`, {
+        method: "PUT",
+        body: JSON.stringify({ config: generalConfig, version: generalData.version })
+      });
       renderGeneralSettings();
       setStatus("通用设置已保存。", "ok");
     }
@@ -397,6 +450,7 @@
       setStatus(error.message || "通用设置保存失败。", "error");
       if (String(error.message || "").includes("已更新")) {
         await loadProactive();
+        await loadGeneral();
         renderGeneralSettings();
       }
     }
@@ -419,7 +473,9 @@
       elements.memoryNav.querySelectorAll(".memory-nav-button").forEach(button => {
         button.classList.toggle("active", button.dataset.memorySection === selectedMemorySection);
       });
-      if (selectedMemorySection === "facts") {
+      if (selectedMemorySection === "affection") {
+        renderAffection();
+      } else if (selectedMemorySection === "facts") {
         elements.memoryContent.innerHTML = `
           <div class="memory-section-header"><h3>记住的事</h3><button class="secondary" id="addFact">+ 添加</button></div>
           ${memoryRows(memoryData.facts, "facts")}
@@ -444,6 +500,11 @@
       document.getElementById("addFact")?.addEventListener("click", () => addMemory("facts", "输入要记住的关键信息：").catch(handleMemoryError));
       document.getElementById("addRule")?.addEventListener("click", () => addMemory("rules", "输入必须遵守的规则：").catch(handleMemoryError));
       document.getElementById("saveMemorySettings")?.addEventListener("click", () => saveMemorySettings().catch(handleMemoryError));
+      document.getElementById("saveAffection")?.addEventListener("click", () => saveAffection().catch(handleMemoryError));
+      const affectionRange = document.getElementById("affectionRange");
+      const affectionNumber = document.getElementById("affectionNumber");
+      affectionRange?.addEventListener("input", () => affectionNumber.value = affectionRange.value);
+      affectionNumber?.addEventListener("input", () => affectionRange.value = Math.max(0, Math.min(500, Number(affectionNumber.value) || 0)));
       document.querySelectorAll(".edit-overview").forEach(button => {
         button.addEventListener("click", () => editOverviewEntry(button.dataset.kind, Number(button.dataset.id)).catch(handleMemoryError));
       });
@@ -461,6 +522,53 @@
         await loadMemory();
         renderMemories();
       }
+    }
+
+    function renderAffection() {
+      if (!affectionData) {
+        elements.memoryContent.innerHTML = '<div class="empty">正在读取好感度...</div>';
+        return;
+      }
+      const value = Number(affectionData.value || 0);
+      const history = affectionData.history || [];
+      elements.memoryContent.innerHTML = `
+        <div class="memory-section-header"><h3>好感度</h3></div>
+        <div class="affection-value"><strong>${value}</strong><span>/ 500</span></div>
+        <div class="affection-progress"><span style="width:${value / 5}%"></span></div>
+        <div class="affection-controls">
+          <input id="affectionRange" type="range" min="0" max="500" value="${value}">
+          <input id="affectionNumber" type="number" min="0" max="500" value="${value}">
+        </div>
+        <button class="save" id="saveAffection">保存初始/当前好感度</button>
+        <div class="memory-section-header" style="margin-top:28px"><h3>最近自动变化</h3></div>
+        <div class="affection-history">
+          ${history.length ? history.map(item => {
+            const delta = Number(item.delta || 0);
+            const sign = delta > 0 ? "+" : "";
+            const className = delta >= 0 ? "positive" : "negative";
+            return `
+              <div class="affection-history-row">
+                <strong class="${className}">${sign}${delta}</strong>
+                <span> · 变化后 ${item.value_after}</span>
+                <small> · ${escapeHtml(formatChinaTime(item.created_at))}</small>
+                <div>${escapeHtml(item.reason || "未记录原因")}</div>
+              </div>
+            `;
+          }).join("") : '<div class="empty">暂无自动变化记录</div>'}
+        </div>
+      `;
+    }
+
+    async function saveAffection() {
+      const value = Math.max(0, Math.min(
+        500, Number(document.getElementById("affectionNumber").value) || 0
+      ));
+      affectionData = await api(`/api/affection/${encodeURIComponent(activeCharacter().id)}`, {
+        method: "PUT",
+        body: JSON.stringify({ value, version: affectionData.version })
+      });
+      renderMemories();
+      setStatus("好感度已保存。", "ok");
     }
 
     function renderMemorySettings() {

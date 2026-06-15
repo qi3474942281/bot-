@@ -96,6 +96,14 @@ def get_active_model_name() -> str | None:
     return models.get(active_key, {}).get("model")
 
 
+def get_character_model_key(character_id: str) -> str | None:
+    models = get_model_profiles()
+    configured = clawbot_store.general_snapshot(character_id)["config"]["currentModel"]
+    if configured in models:
+        return configured
+    return get_active_model_key()
+
+
 def resolve_model_runtime(model_key: str | None = None) -> dict:
     cfg = load_config_file()
     models = cfg.get("models") or {}
@@ -132,15 +140,19 @@ def create_ai_client(runtime: dict):
     ))
 
 
-def save_active_model_key(model_key: str):
-    cfg = load_config_file()
-    cfg["current_model"] = model_key
-    save_config_file(cfg)
+def save_character_model_key(character_id: str, model_key: str):
+    snapshot = clawbot_store.general_snapshot(character_id)
+    config = dict(snapshot["config"])
+    config["currentModel"] = model_key
+    clawbot_store.save_general_config(
+        character_id, config, snapshot["version"], get_model_profiles()
+    )
 
 
 def format_model_list() -> str:
     models = get_model_profiles()
-    active_key = get_active_model_key()
+    character_id = clawbot_store.active_character()["id"]
+    active_key = get_character_model_key(character_id)
     if not models:
         return "No models configured."
 
@@ -165,7 +177,8 @@ def handle_model_command(text: str) -> tuple[bool, str | None]:
     if model_key not in models:
         return True, f"Unknown model: {model_key}\n\n{format_model_list()}"
 
-    save_active_model_key(model_key)
+    character_id = clawbot_store.active_character()["id"]
+    save_character_model_key(character_id, model_key)
     model_name = models[model_key].get("model", "")
     return True, f"Switched model to {model_key}: {model_name}"
 
@@ -175,7 +188,11 @@ def format_memory_settings() -> str:
     snapshot = clawbot_store.memory_snapshot(character["id"])
     config = snapshot["config"]
     progress = snapshot["progress"]
-    model = config["summaryModel"] or get_active_model_key() or "未配置"
+    model = (
+        config["summaryModel"]
+        or get_character_model_key(character["id"])
+        or "未配置"
+    )
     return "\n".join(
         [
             "记忆设置：",
@@ -264,6 +281,124 @@ def _extract_json(text):
     return result
 
 
+def split_reply_messages(text: str) -> list[str]:
+    value = str(text or "").strip()
+    if not value:
+        return []
+    if len(value) <= 50:
+        return [value]
+
+    tokens = re.split(
+        r"(```[\s\S]*?```|https?://\S+|[^\n。！？!?；;]+[。！？!?；;]?|\n+)",
+        value,
+    )
+    units = [item.strip() for item in tokens if item and item.strip()]
+    target = 60 if len(value) <= 120 else 85
+    parts = []
+    current = ""
+    for unit in units:
+        if unit.startswith("```") or unit.startswith(("http://", "https://")):
+            if current:
+                parts.append(current)
+                current = ""
+            parts.append(unit)
+            continue
+        candidate = f"{current}{unit}" if current else unit
+        if current and len(candidate) > target:
+            parts.append(current)
+            current = unit
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+
+    merged = []
+    for part in parts:
+        if merged and len(part) < 18 and not part.startswith(("```", "http")):
+            merged[-1] += part
+        else:
+            merged.append(part)
+    if len(value) <= 120 and len(merged) > 2:
+        midpoint = max(1, len(merged) // 2)
+        merged = ["".join(merged[:midpoint]), "".join(merged[midpoint:])]
+    return [item for item in merged if item]
+
+
+def _chat_result_prompt(character: dict, repair_error=None) -> str:
+    rules = "\n".join(f"- {item}" for item in character.get("promptMemories", []))
+    repair = (
+        f"\n上一次输出格式不合格：{repair_error}。请修正并只输出 JSON。"
+        if repair_error
+        else ""
+    )
+    return (
+        "\n\n【本轮输出格式】\n"
+        "只输出一个 JSON 对象，不要使用 Markdown 代码块："
+        '{"reply":"给用户的自然回复正文","affectionDelta":整数,'
+        '"affectionReason":"简短原因","ruleOverride":true或false}。\n'
+        "reply 必须符合人物设定，可以包含多句和自然分段。\n"
+        "无明确好感度数值规则时，affectionDelta 必须在 -5 到 5 之间；"
+        "只有下列必须遵守的规则明确写出了数值，并且本轮确实命中时，"
+        "ruleOverride 才能为 true，并按规则返回增减值。\n"
+        f"必须遵守的规则：\n{rules or '无明确好感度数值规则'}"
+        f"{repair}"
+    )
+
+
+def generate_chat_result(
+    text: str, character_id: str, model_key: str, user_id: str
+) -> dict:
+    runtime = resolve_model_runtime(model_key)
+    chat_ai = create_ai_client(runtime)
+    character = clawbot_store.character(character_id)
+    base_prompt = clawbot_store.build_prompt(runtime["prompt"], character_id)
+    history = clawbot_store.recent_history(
+        user_id, character_id=character_id
+    )
+    last_error = None
+    fallback_text = ""
+    for _attempt in range(2):
+        raw = chat_ai.chat(
+            text,
+            model=runtime["model"],
+            prompt=base_prompt + _chat_result_prompt(character, last_error),
+            history=history,
+        )
+        fallback_text = str(raw or "").strip() or fallback_text
+        try:
+            result = _extract_json(raw)
+            reply = str(result.get("reply") or "").strip()
+            if not reply:
+                raise ValueError("reply 不能为空")
+            delta = int(result.get("affectionDelta", 0))
+            rule_override = bool(result.get("ruleOverride", False))
+            if not rule_override:
+                delta = max(-5, min(5, delta))
+            else:
+                delta = max(-500, min(500, delta))
+            return {
+                "reply": reply,
+                "affectionDelta": delta,
+                "affectionReason": str(
+                    result.get("affectionReason") or ""
+                ).strip()[:1000],
+            }
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            last_error = str(error)
+    fallback_reply = fallback_text
+    try:
+        fallback_result = _extract_json(fallback_text)
+        if isinstance(fallback_result, dict) and fallback_result.get("reply"):
+            fallback_reply = str(fallback_result["reply"]).strip()
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return {
+        "reply": fallback_reply,
+        "affectionDelta": 0,
+        "affectionReason": "",
+    }
+
+
 def _summary_prompt(task, repair_error=None):
     config = task["config"]
     repair = (
@@ -331,10 +466,12 @@ def _validate_summary_result(task, result):
 
 
 def run_memory_summary(task):
-    model_key = task["config"]["summaryModel"] or get_active_model_key()
+    model_key = task["config"]["summaryModel"] or get_character_model_key(
+        task["characterId"]
+    )
     profiles = get_model_profiles()
     if model_key not in profiles:
-        model_key = get_active_model_key()
+        model_key = get_character_model_key(task["characterId"])
     runtime = resolve_model_runtime(model_key)
     summary_ai = create_ai_client(runtime)
     last_error = None
@@ -593,6 +730,60 @@ async def send_msg_safe(session, to_id, context_token, text, bot_token_ref, bot_
         print(f"[重连通知] 发送失败({e})，降级打印: {text}")
 
 
+async def send_text_message(
+    session, to_id, context_token, text, bot_token_ref, bot_base_url_ref
+):
+    client_id = f"openclaw-weixin-{random.randint(0, 0xFFFFFFFF):08x}"
+    body = {
+        "msg": {
+            "from_user_id": "",
+            "to_user_id": to_id,
+            "client_id": client_id,
+            "message_type": 2,
+            "message_state": 2,
+            "context_token": context_token,
+            "item_list": [{"type": 1, "text_item": {"text": text}}],
+        },
+        "base_info": base_info(),
+    }
+    url = f"{bot_base_url_ref[0] or BASE_URL}/ilink/bot/sendmessage"
+    async with session.post(
+        url,
+        json=body,
+        headers=make_headers(bot_token_ref[0]),
+    ) as response:
+        raw = await response.text()
+        if response.status >= 400:
+            raise RuntimeError(
+                f"WeChat HTTP {response.status}: {raw[:200]}"
+            )
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("WeChat returned an invalid response") from error
+    if isinstance(result, dict) and result.get("errcode") not in (None, 0):
+        raise RuntimeError(
+            result.get("errmsg") or f"WeChat API error {result['errcode']}"
+        )
+    return result
+
+
+async def send_reply_parts(
+    session, to_id, context_token, parts, bot_token_ref, bot_base_url_ref
+):
+    for index, part in enumerate(parts):
+        await send_text_message(
+            session,
+            to_id,
+            context_token,
+            part,
+            bot_token_ref,
+            bot_base_url_ref,
+        )
+        if index + 1 < len(parts):
+            await asyncio.sleep(random.uniform(1, 5))
+
+
 PROACTIVE_INTERVALS = {
     "random_1_30": (1, 30),
     "random_30_60": (30, 60),
@@ -616,10 +807,10 @@ def next_proactive_time(config, now=None):
     return defer_to_proactive_window(now + timedelta(minutes=minutes), config)
 
 
-def generate_proactive_message(user_id):
-    runtime = resolve_model_runtime(get_active_model_key())
+def generate_proactive_message(user_id, character_id):
+    runtime = resolve_model_runtime(get_character_model_key(character_id))
     proactive_ai = create_ai_client(runtime)
-    prompt = clawbot_store.build_prompt(runtime["prompt"])
+    prompt = clawbot_store.build_prompt(runtime["prompt"], character_id)
     prompt += (
         "\n\n【主动消息要求】\n"
         "现在请你自然地主动开启一段对话。结合人物设定、记忆和最近聊天，"
@@ -630,7 +821,9 @@ def generate_proactive_message(user_id):
         "请根据当前关系和上下文，生成一条现在适合主动发给用户的消息。",
         model=runtime["model"],
         prompt=prompt,
-        history=clawbot_store.recent_history(user_id),
+        history=clawbot_store.recent_history(
+            user_id, character_id=character_id
+        ),
     )
 
 
@@ -698,27 +891,35 @@ async def proactive_message_task(
 
             loop = asyncio.get_running_loop()
             reply = await loop.run_in_executor(
-                executor, partial(generate_proactive_message, last_contact["from_id"])
+                executor,
+                partial(
+                    generate_proactive_message,
+                    last_contact["from_id"],
+                    character_id,
+                ),
             )
             reply = str(reply or "").strip()
             if not reply:
                 raise ValueError("主动消息模型返回空内容")
             if clawbot_store.active_character()["id"] != character_id:
                 continue
-            await send_proactive_message(
+            parts = split_reply_messages(reply)
+            await send_reply_parts(
                 session,
                 last_contact["from_id"],
                 last_contact["context_token"],
-                reply,
+                parts,
                 bot_token_ref,
                 bot_base_url_ref,
             )
-            clawbot_store.add_message(
-                last_contact["from_id"],
-                "assistant",
-                reply,
-                count_for_memory=False,
-            )
+            for part in parts:
+                clawbot_store.add_message(
+                    last_contact["from_id"],
+                    "assistant",
+                    part,
+                    count_for_memory=False,
+                    character_id=character_id,
+                )
             clawbot_store.mark_proactive_sent(
                 character_id, next_proactive_time(config, now), now
             )
@@ -1093,6 +1294,173 @@ async def login_with_qrcode(session, base_url=BASE_URL):
             raise RuntimeError("二维码多次失效或登录失败，请稍后重试。")
 
 
+async def process_chat_batch(
+    session,
+    batch,
+    typing_ticket_cache,
+    bot_token_ref,
+    bot_base_url_ref,
+):
+    from_id = batch["from_id"]
+    context_token = batch["context_token"]
+    character_id = batch["character_id"]
+    model_key = batch["model_key"]
+    text = "\n".join(batch["messages"])
+    typing_ticket = ""
+    try:
+        if from_id not in typing_ticket_cache:
+            cfg = await api_post(
+                session,
+                "ilink/bot/getconfig",
+                {
+                    "ilink_user_id": from_id,
+                    "context_token": context_token,
+                    "base_info": base_info(),
+                },
+                bot_token_ref[0],
+                bot_base_url_ref[0] or None,
+            )
+            typing_ticket_cache[from_id] = cfg.get("typing_ticket", "")
+        typing_ticket = typing_ticket_cache[from_id]
+        if typing_ticket:
+            await api_post(
+                session,
+                "ilink/bot/sendtyping",
+                {
+                    "ilink_user_id": from_id,
+                    "typing_ticket": typing_ticket,
+                    "status": 1,
+                    "base_info": base_info(),
+                },
+                bot_token_ref[0],
+                bot_base_url_ref[0] or None,
+            )
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            executor,
+            partial(
+                generate_chat_result,
+                text,
+                character_id,
+                model_key,
+                from_id,
+            ),
+        )
+        parts = split_reply_messages(result["reply"])
+        if not parts:
+            raise ValueError("AI returned an empty reply")
+        await send_reply_parts(
+            session,
+            from_id,
+            context_token,
+            parts,
+            bot_token_ref,
+            bot_base_url_ref,
+        )
+
+        clawbot_store.add_message(
+            from_id, "user", text, character_id=character_id
+        )
+        for part in parts:
+            clawbot_store.add_message(
+                from_id, "assistant", part, character_id=character_id
+            )
+        try:
+            clawbot_store.apply_affection_delta(
+                character_id,
+                result["affectionDelta"],
+                result["affectionReason"],
+            )
+        except Exception as error:
+            print(f"Failed to update affection: {error}")
+        memory_failed = await process_memory_tasks(
+            loop, character_id, from_id
+        )
+        if memory_failed:
+            await send_msg_safe(
+                session,
+                from_id,
+                context_token,
+                "记忆总结失败，稍后自动重试。",
+                bot_token_ref,
+                bot_base_url_ref,
+            )
+        print(f"已完成一轮回复，共 {len(parts)} 条消息")
+    except Exception as error:
+        print(f"处理聊天批次失败: {error}")
+    finally:
+        if typing_ticket:
+            try:
+                await api_post(
+                    session,
+                    "ilink/bot/sendtyping",
+                    {
+                        "ilink_user_id": from_id,
+                        "typing_ticket": typing_ticket,
+                        "status": 2,
+                        "base_info": base_info(),
+                    },
+                    bot_token_ref[0],
+                    bot_base_url_ref[0] or None,
+                )
+            except Exception as error:
+                print(f"取消输入状态失败: {error}")
+
+
+def enqueue_chat_message(
+    buffers,
+    session,
+    from_id,
+    context_token,
+    text,
+    typing_ticket_cache,
+    bot_token_ref,
+    bot_base_url_ref,
+):
+    state = buffers.setdefault(
+        from_id,
+        {"messages": [], "timer": None},
+    )
+    if not state["messages"]:
+        character_id = clawbot_store.active_character()["id"]
+        state["character_id"] = character_id
+        state["model_key"] = get_character_model_key(character_id)
+    state["messages"].append(text)
+    state["context_token"] = context_token
+    if state["timer"] and not state["timer"].done():
+        state["timer"].cancel()
+    wait_seconds = clawbot_store.general_snapshot(
+        state["character_id"]
+    )["config"]["mergeWaitSeconds"]
+
+    async def flush_after_wait():
+        try:
+            await asyncio.sleep(wait_seconds)
+        except asyncio.CancelledError:
+            return
+        batch = {
+            "from_id": from_id,
+            "context_token": state["context_token"],
+            "character_id": state["character_id"],
+            "model_key": state["model_key"],
+            "messages": list(state["messages"]),
+        }
+        state["messages"].clear()
+        state["timer"] = None
+        asyncio.create_task(
+            process_chat_batch(
+                session,
+                batch,
+                typing_ticket_cache,
+                bot_token_ref,
+                bot_base_url_ref,
+            )
+        )
+
+    state["timer"] = asyncio.create_task(flush_after_wait())
+
+
 async def main():
     try:
         await start_backend(clawbot_store, model_loader=get_model_profiles)
@@ -1111,6 +1479,7 @@ async def main():
         bot_token_ref = [bot_token]
         bot_base_url_ref = [bot_base_url]
         typing_ticket_cache = {}
+        chat_buffers = {}
         last_contact = {"from_id": "", "context_token": ""}
         asyncio.create_task(
             proactive_message_task(
@@ -1160,99 +1529,16 @@ async def main():
                     )
                     continue
 
-                # getconfig 获取 typing_ticket（每个用户缓存一次）
-                if from_id not in typing_ticket_cache:
-                    cfg = await api_post(
-                        session,
-                        "ilink/bot/getconfig",
-                        {"ilink_user_id": from_id, "context_token": context_token,
-                         "base_info": base_info()},
-                        bot_token_ref[0],
-                        bot_base_url_ref[0] or None,
-                    )
-                    typing_ticket_cache[from_id] = cfg.get("typing_ticket", "")
-                typing_ticket = typing_ticket_cache[from_id]
-
-                # sendtyping status=1 表示"正在输入"
-                if typing_ticket:
-                    await api_post(
-                        session,
-                        "ilink/bot/sendtyping",
-                        {"ilink_user_id": from_id, "typing_ticket": typing_ticket,
-                         "status": 1, "base_info": base_info()},
-                        bot_token_ref[0],
-                        bot_base_url_ref[0] or None,
-                    )
-
-                # 调用 AI
-                loop = asyncio.get_event_loop()
-                # 或者替换为你自已要用的接口
-                character_id = clawbot_store.active_character()["id"]
-                active_model_key = get_active_model_key()
-                active_runtime = resolve_model_runtime(active_model_key)
-                active_ai = create_ai_client(active_runtime)
-                active_prompt = clawbot_store.build_prompt(active_runtime["prompt"])
-                recent_history = clawbot_store.recent_history(from_id)
-                reply = await loop.run_in_executor(
-                    executor,
-                    partial(
-                        active_ai.chat,
-                        text,
-                        model=active_runtime["model"],
-                        prompt=active_prompt,
-                        history=recent_history,
-                    ),
-                )
-                if reply:
-                    clawbot_store.add_message(from_id, "user", text)
-                    clawbot_store.add_message(from_id, "assistant", reply)
-
-                # sendmessage（补全 SDK 所需字段）
-                client_id = f"openclaw-weixin-{random.randint(0, 0xFFFFFFFF):08x}"
-                send_result = await api_post(
+                enqueue_chat_message(
+                    chat_buffers,
                     session,
-                    "ilink/bot/sendmessage",
-                    {
-                        "msg": {
-                            "from_user_id": "",
-                            "to_user_id": from_id,
-                            "client_id": client_id,
-                            "message_type": 2,
-                            "message_state": 2,
-                            "context_token": context_token,
-                            "item_list": [{"type": 1, "text_item": {"text": reply}}],
-                        },
-                        "base_info": base_info(),
-                    },
-                    bot_token_ref[0],
-                    bot_base_url_ref[0] or None,
+                    from_id,
+                    context_token,
+                    text,
+                    typing_ticket_cache,
+                    bot_token_ref,
+                    bot_base_url_ref,
                 )
-                print(f"sendmessage 返回: {send_result}")
-                print(f"已回复: {reply[:50]}...")
-
-                memory_failed = await process_memory_tasks(
-                    loop, character_id, from_id
-                )
-                if memory_failed:
-                    await send_msg_safe(
-                        session,
-                        from_id,
-                        context_token,
-                        "记忆总结失败，稍后自动重试。",
-                        bot_token_ref,
-                        bot_base_url_ref,
-                    )
-
-                # sendtyping status=2 取消"正在输入"
-                if typing_ticket:
-                    await api_post(
-                        session,
-                        "ilink/bot/sendtyping",
-                        {"ilink_user_id": from_id, "typing_ticket": typing_ticket,
-                         "status": 2, "base_info": base_info()},
-                        bot_token_ref[0],
-                        bot_base_url_ref[0] or None,
-                    )
 
 
 if __name__ == "__main__":

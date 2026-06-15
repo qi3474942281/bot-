@@ -63,6 +63,10 @@ DEFAULT_PROACTIVE_PROGRESS = {
     "lastSentAt": "",
     "lastError": "",
 }
+DEFAULT_GENERAL_CONFIG = {
+    "mergeWaitSeconds": 6,
+    "currentModel": "",
+}
 
 
 class VersionConflict(ValueError):
@@ -127,6 +131,22 @@ def _normalize_proactive_progress(value) -> dict:
         "lastSentAt": _clean_text(raw.get("lastSentAt"), 80),
         "lastError": _clean_text(raw.get("lastError"), 1000),
     }
+
+
+def _normalize_general_config(value) -> dict:
+    raw = value if isinstance(value, dict) else {}
+    return {
+        "mergeWaitSeconds": _int_setting(
+            raw.get("mergeWaitSeconds"), 6, 1, 30
+        ),
+        "currentModel": _clean_text(raw.get("currentModel"), 100),
+    }
+
+
+def _normalize_affection_value(value) -> int:
+    if isinstance(value, dict):
+        value = value.get("value")
+    return _int_setting(value, 0, 0, 500)
 
 
 def _parse_utc(value):
@@ -317,6 +337,28 @@ class ClawBotStore:
                     version INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS general_profiles (
+                    character_id TEXT PRIMARY KEY,
+                    config_json TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS affection_profiles (
+                    character_id TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS affection_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    character_id TEXT NOT NULL,
+                    delta INTEGER NOT NULL,
+                    value_after INTEGER NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS affection_history_character
+                ON affection_history(character_id, id DESC);
                 """
             )
             message_columns = {
@@ -416,6 +458,36 @@ class ClawBotStore:
                         now,
                     ),
                 )
+            general = connection.execute(
+                "SELECT 1 FROM general_profiles WHERE character_id = ?",
+                (character["id"],),
+            ).fetchone()
+            if not general:
+                connection.execute(
+                    """
+                    INSERT INTO general_profiles(
+                        character_id, config_json, version, updated_at
+                    ) VALUES(?, ?, 1, ?)
+                    """,
+                    (
+                        character["id"],
+                        json.dumps(DEFAULT_GENERAL_CONFIG, ensure_ascii=False),
+                        now,
+                    ),
+                )
+            affection = connection.execute(
+                "SELECT 1 FROM affection_profiles WHERE character_id = ?",
+                (character["id"],),
+            ).fetchone()
+            if not affection:
+                connection.execute(
+                    """
+                    INSERT INTO affection_profiles(
+                        character_id, value, version, updated_at
+                    ) VALUES(?, 0, 1, ?)
+                    """,
+                    (character["id"], now),
+                )
 
     def get_state(self) -> dict:
         with self.lock, self._connect() as connection:
@@ -444,6 +516,148 @@ class ClawBotStore:
             for item in state["characters"]
             if item["id"] == state["activeCharacterId"]
         )
+
+    def character(self, character_id: str) -> dict:
+        state = self.get_state()
+        for item in state["characters"]:
+            if item["id"] == character_id:
+                return item
+        raise ValueError("character not found")
+
+    def general_snapshot(self, character_id: str) -> dict:
+        with self.lock, self._connect() as connection:
+            self._ensure_profiles(connection, self._state_from_connection(connection))
+            row = connection.execute(
+                "SELECT * FROM general_profiles WHERE character_id = ?",
+                (character_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("character general profile not found")
+            config = dict(DEFAULT_GENERAL_CONFIG)
+            config.update(json.loads(row["config_json"]))
+        return {
+            "characterId": character_id,
+            "config": _normalize_general_config(config),
+            "version": row["version"],
+        }
+
+    def save_general_config(
+        self, character_id, value, expected_version, available_models=None
+    ) -> dict:
+        config = _normalize_general_config(value)
+        models = available_models or {}
+        if config["currentModel"] and config["currentModel"] not in models:
+            raise ValueError("chat model must come from the current model list")
+        with self.lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT version FROM general_profiles WHERE character_id = ?",
+                (character_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("character general profile not found")
+            if expected_version is None or int(expected_version) != row["version"]:
+                raise VersionConflict("通用设置已更新，请刷新后重试")
+            connection.execute(
+                """
+                UPDATE general_profiles
+                SET config_json = ?, version = version + 1, updated_at = ?
+                WHERE character_id = ?
+                """,
+                (
+                    json.dumps(config, ensure_ascii=False),
+                    datetime.now(timezone.utc).isoformat(),
+                    character_id,
+                ),
+            )
+        return self.general_snapshot(character_id)
+
+    def affection_snapshot(self, character_id: str) -> dict:
+        with self.lock, self._connect() as connection:
+            self._ensure_profiles(connection, self._state_from_connection(connection))
+            row = connection.execute(
+                "SELECT * FROM affection_profiles WHERE character_id = ?",
+                (character_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("character affection profile not found")
+            history = connection.execute(
+                """
+                SELECT id, delta, value_after, reason, created_at
+                FROM affection_history
+                WHERE character_id = ?
+                ORDER BY id DESC LIMIT 10
+                """,
+                (character_id,),
+            ).fetchall()
+        return {
+            "characterId": character_id,
+            "value": _normalize_affection_value(row["value"]),
+            "history": [dict(item) for item in history],
+            "version": row["version"],
+        }
+
+    def save_affection(self, character_id, value, expected_version) -> dict:
+        normalized = _normalize_affection_value(value)
+        with self.lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT version FROM affection_profiles WHERE character_id = ?",
+                (character_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("character affection profile not found")
+            if expected_version is None or int(expected_version) != row["version"]:
+                raise VersionConflict("好感度已更新，请刷新后重试")
+            connection.execute(
+                """
+                UPDATE affection_profiles
+                SET value = ?, version = version + 1, updated_at = ?
+                WHERE character_id = ?
+                """,
+                (
+                    normalized,
+                    datetime.now(timezone.utc).isoformat(),
+                    character_id,
+                ),
+            )
+        return self.affection_snapshot(character_id)
+
+    def apply_affection_delta(self, character_id, delta, reason) -> dict:
+        delta = _int_setting(delta, 0, -500, 500)
+        now = datetime.now(timezone.utc).isoformat()
+        with self.lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM affection_profiles WHERE character_id = ?",
+                (character_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("character affection profile not found")
+            old_value = _normalize_affection_value(row["value"])
+            new_value = max(0, min(500, old_value + delta))
+            applied_delta = new_value - old_value
+            connection.execute(
+                """
+                UPDATE affection_profiles
+                SET value = ?, version = version + 1, updated_at = ?
+                WHERE character_id = ?
+                """,
+                (new_value, now, character_id),
+            )
+            if applied_delta:
+                connection.execute(
+                    """
+                    INSERT INTO affection_history(
+                        character_id, delta, value_after, reason, created_at
+                    ) VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (
+                        character_id,
+                        applied_delta,
+                        new_value,
+                        _clean_text(reason, 1000),
+                        now,
+                    ),
+                )
+        return self.affection_snapshot(character_id)
 
     def proactive_snapshot(self, character_id: str) -> dict:
         with self.lock, self._connect() as connection:
@@ -781,11 +995,19 @@ class ClawBotStore:
             (datetime.now(timezone.utc).isoformat(), character_id),
         )
 
-    def build_prompt(self, fallback_prompt: str) -> str:
-        character = self.active_character()
+    def build_prompt(self, fallback_prompt: str, character_id: str | None = None) -> str:
+        character = (
+            self.character(character_id) if character_id else self.active_character()
+        )
         persona = character["persona"]
         snapshot = self.memory_snapshot(character["id"])
+        affection = self.affection_snapshot(character["id"])
         sections = [fallback_prompt, f"你当前扮演：{character['name']}。"]
+        sections.append(
+            "【当前好感度】\n"
+            f"{affection['value']} / 500。请让亲近程度自然反映这个数值，"
+            "不要在回复中直接提到好感度数值或系统设置。"
+        )
         if persona["description"]:
             sections.append(f"【核心人设】\n{persona['description']}")
         if persona["traits"]:
@@ -821,9 +1043,16 @@ class ClawBotStore:
         return "\n\n".join(section for section in sections if section)
 
     def add_message(
-        self, user_id: str, role: str, content: str, count_for_memory: bool = True
+        self,
+        user_id: str,
+        role: str,
+        content: str,
+        count_for_memory: bool = True,
+        character_id: str | None = None,
     ):
-        character = self.active_character()
+        character = (
+            self.character(character_id) if character_id else self.active_character()
+        )
         now = datetime.now(timezone.utc).isoformat()
         with self.lock, self._connect() as connection:
             cursor = connection.execute(
@@ -851,8 +1080,12 @@ class ClawBotStore:
             )
         return cursor.lastrowid
 
-    def recent_history(self, user_id: str, limit: int = 20) -> list[dict]:
-        character = self.active_character()
+    def recent_history(
+        self, user_id: str, limit: int = 20, character_id: str | None = None
+    ) -> list[dict]:
+        character = (
+            self.character(character_id) if character_id else self.active_character()
+        )
         with self.lock, self._connect() as connection:
             rows = connection.execute(
                 """
@@ -1322,6 +1555,53 @@ def create_api_app(store: ClawBotStore, config: dict, model_loader=None) -> web.
         except (json.JSONDecodeError, ValueError, TypeError) as error:
             return web.json_response({"error": str(error)}, status=400)
 
+    async def get_general(request):
+        try:
+            result = store.general_snapshot(request.match_info["character_id"])
+            result["models"] = model_loader() if model_loader else {}
+            return web.json_response(result)
+        except ValueError as error:
+            return web.json_response({"error": str(error)}, status=404)
+
+    async def put_general(request):
+        try:
+            body = await request.json()
+            models = model_loader() if model_loader else {}
+            result = store.save_general_config(
+                request.match_info["character_id"],
+                body.get("config"),
+                body.get("version"),
+                models,
+            )
+            result["models"] = models
+            return web.json_response(result)
+        except VersionConflict as error:
+            return web.json_response({"error": str(error)}, status=409)
+        except (json.JSONDecodeError, ValueError, TypeError) as error:
+            return web.json_response({"error": str(error)}, status=400)
+
+    async def get_affection(request):
+        try:
+            return web.json_response(
+                store.affection_snapshot(request.match_info["character_id"])
+            )
+        except ValueError as error:
+            return web.json_response({"error": str(error)}, status=404)
+
+    async def put_affection(request):
+        try:
+            body = await request.json()
+            result = store.save_affection(
+                request.match_info["character_id"],
+                body.get("value"),
+                body.get("version"),
+            )
+            return web.json_response(result)
+        except VersionConflict as error:
+            return web.json_response({"error": str(error)}, status=409)
+        except (json.JSONDecodeError, ValueError, TypeError) as error:
+            return web.json_response({"error": str(error)}, status=400)
+
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/state", get_state)
     app.router.add_put("/api/state", put_state)
@@ -1336,6 +1616,10 @@ def create_api_app(store: ClawBotStore, config: dict, model_loader=None) -> web.
     )
     app.router.add_get("/api/proactive/{character_id}", get_proactive)
     app.router.add_put("/api/proactive/{character_id}", put_proactive)
+    app.router.add_get("/api/general/{character_id}", get_general)
+    app.router.add_put("/api/general/{character_id}", put_general)
+    app.router.add_get("/api/affection/{character_id}", get_affection)
+    app.router.add_put("/api/affection/{character_id}", put_affection)
     return app
 
 

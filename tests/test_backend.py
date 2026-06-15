@@ -20,6 +20,10 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 "token": "test-token",
                 "allowed_origins": ["https://qi3474942281.github.io"],
             },
+            model_loader=lambda: {
+                "fast": {"model": "fast-model"},
+                "smart": {"model": "smart-model"},
+            },
         )
         self.client = TestClient(TestServer(app))
         await self.client.start_server()
@@ -388,6 +392,101 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 datetime(2026, 6, 14, 4, 0, tzinfo=timezone.utc), overnight
             )
         )
+
+    async def test_general_config_is_per_character_and_versioned(self):
+        models = {
+            "fast": {"model": "fast-model"},
+            "smart": {"model": "smart-model"},
+        }
+        snapshot = self.store.general_snapshot("default")
+        config = dict(snapshot["config"])
+        config.update({"mergeWaitSeconds": 9, "currentModel": "smart"})
+        updated = self.store.save_general_config(
+            "default", config, snapshot["version"], models
+        )
+        self.assertEqual(updated["config"]["mergeWaitSeconds"], 9)
+        self.assertEqual(updated["config"]["currentModel"], "smart")
+        with self.assertRaises(ValueError):
+            self.store.save_general_config(
+                "default", config, snapshot["version"], models
+            )
+        with self.assertRaises(ValueError):
+            self.store.save_general_config(
+                "default",
+                {**config, "currentModel": "missing"},
+                updated["version"],
+                models,
+            )
+
+        response = await self.client.get(
+            "/api/general/default", headers=self.headers
+        )
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertIn("smart", payload["models"])
+        response = await self.client.put(
+            "/api/general/default",
+            headers=self.headers,
+            json={
+                "config": {
+                    "mergeWaitSeconds": 7,
+                    "currentModel": "fast",
+                },
+                "version": payload["version"],
+            },
+        )
+        self.assertEqual(response.status, 200)
+
+    async def test_affection_manual_save_delta_limits_and_recent_history(self):
+        snapshot = self.store.affection_snapshot("default")
+        self.assertEqual(snapshot["value"], 0)
+        saved = self.store.save_affection(
+            "default", 490, snapshot["version"]
+        )
+        self.assertEqual(saved["value"], 490)
+        self.assertEqual(saved["history"], [])
+
+        self.store.apply_affection_delta("default", 20, "明确规则奖励")
+        self.assertEqual(self.store.affection_snapshot("default")["value"], 500)
+        self.store.apply_affection_delta("default", -600, "严重负面互动")
+        self.assertEqual(self.store.affection_snapshot("default")["value"], 0)
+        for number in range(12):
+            self.store.apply_affection_delta(
+                "default", 1, f"变化 {number}"
+            )
+        recent = self.store.affection_snapshot("default")["history"]
+        self.assertEqual(len(recent), 10)
+        self.assertEqual(recent[0]["reason"], "变化 11")
+
+        response = await self.client.get(
+            "/api/affection/default", headers=self.headers
+        )
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        response = await self.client.put(
+            "/api/affection/default",
+            headers=self.headers,
+            json={"value": 123, "version": payload["version"]},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["value"], 123)
+
+    async def test_multiple_assistant_bubbles_count_as_one_memory_round(self):
+        snapshot = self.store.memory_snapshot("default")
+        config = dict(snapshot["config"])
+        config.update({"factRounds": 2, "stmRounds": 2})
+        self.store.save_memory_config(
+            "default", config, snapshot["version"]
+        )
+        self.store.add_message("user-1", "user", "合并后的用户消息")
+        self.store.add_message("user-1", "assistant", "第一条回复")
+        self.store.add_message("user-1", "assistant", "第二条回复")
+        self.assertEqual(
+            self.store.prepare_memory_tasks("default", "user-1"), []
+        )
+        progress = self.store.memory_snapshot("default")["progress"]
+        self.assertEqual(progress["factRounds"], 1)
+        self.assertEqual(progress["stmRounds"], 1)
 
 
 if __name__ == "__main__":
