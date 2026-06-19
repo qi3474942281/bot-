@@ -9,7 +9,7 @@ import aiohttp
 import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 from dusapi import DusAPI, DusConfig
@@ -25,6 +25,7 @@ from clawbot_backend import (
 executor = ThreadPoolExecutor(max_workers=4)
 ai = None  # 启动时从配置文件加载后初始化
 clawbot_store = ClawBotStore()
+CHINA_TZ = timezone(timedelta(hours=8))
 
 # ========== 自动重连配置（可调参数） ==========
 # 测试时将数值改小，例如：
@@ -396,6 +397,205 @@ def generate_chat_result(
         "reply": fallback_reply,
         "affectionDelta": 0,
         "affectionReason": "",
+    }
+
+
+def _chat_result_prompt_v2(character: dict, repair_error=None, weather_text="") -> str:
+    rules = "\n".join(f"- {item}" for item in character.get("promptMemories", []))
+    repair = (
+        f"\n上一次输出格式不合格：{repair_error}。请修正并只输出 JSON。"
+        if repair_error
+        else ""
+    )
+    weather_section = (
+        f"\n\n【实时天气查询结果】\n{weather_text}\n请基于这份实时天气回答用户。"
+        if weather_text
+        else ""
+    )
+    return (
+        "\n\n【本轮输出格式】\n"
+        "只输出一个 JSON 对象，不要使用 Markdown 代码块："
+        '{"reply":"给用户的自然回复正文","affectionDelta":整数,'
+        '"affectionReason":"简短原因","ruleOverride":true或false,'
+        '"thinkingSummary":"简短思考摘要","weatherCity":"需要查询天气的城市或空字符串"}。\n'
+        "reply 必须符合人物设定，可以包含多句和自然分段。\n"
+        "thinkingSummary 只能是简短、安全的回应思路摘要，不要输出逐步推理链或隐藏推理过程。\n"
+        "只有用户明确询问实时天气、温度、湿度、风力等天气信息时，weatherCity 才填写城市名，否则填空字符串。\n"
+        "无明确好感度数值规则时，affectionDelta 必须在 -5 到 5 之间；"
+        "只有下列必须遵守的规则明确写出了数值，并且本轮确实命中时，"
+        "ruleOverride 才能为 true，并按规则返回增减值。\n"
+        f"必须遵守的规则：\n{rules or '无明确好感度数值规则'}"
+        f"{weather_section}"
+        f"{repair}"
+    )
+
+
+def _format_china_timestamp(value) -> str:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            parsed = datetime.now(timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(CHINA_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _history_for_ai(user_id, character_id, time_aware):
+    history = clawbot_store.recent_history(
+        user_id, character_id=character_id, include_timestamps=time_aware
+    )
+    if not time_aware:
+        return history
+    result = []
+    for item in history:
+        role_label = "用户" if item["role"] == "user" else "ClawBot"
+        result.append(
+            {
+                "role": item["role"],
+                "content": (
+                    f"[北京时间 {_format_china_timestamp(item.get('created_at'))}] "
+                    f"{role_label}：{item['content']}"
+                ),
+            }
+        )
+    return result
+
+
+def _weather_text(city: str) -> str:
+    city = str(city or "").strip()
+    if not city:
+        return ""
+    geo_url = "https://geocoding-api.open-meteo.com/v1/search?" + urlencode(
+        {"name": city, "count": 1, "language": "zh", "format": "json"}
+    )
+    with urllib.request.urlopen(geo_url, timeout=8) as response:
+        geo = json.loads(response.read().decode("utf-8"))
+    results = geo.get("results") or []
+    if not results:
+        raise ValueError(f"查不到城市：{city}")
+    place = results[0]
+    weather_url = "https://api.open-meteo.com/v1/forecast?" + urlencode(
+        {
+            "latitude": place["latitude"],
+            "longitude": place["longitude"],
+            "current": ",".join(
+                [
+                    "temperature_2m",
+                    "relative_humidity_2m",
+                    "apparent_temperature",
+                    "precipitation",
+                    "weather_code",
+                    "cloud_cover",
+                    "pressure_msl",
+                    "wind_speed_10m",
+                    "wind_direction_10m",
+                    "wind_gusts_10m",
+                ]
+            ),
+            "timezone": "Asia/Shanghai",
+        }
+    )
+    with urllib.request.urlopen(weather_url, timeout=8) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    current = payload.get("current") or {}
+    units = payload.get("current_units") or {}
+    name = place.get("name") or city
+    country = place.get("country") or ""
+    admin = place.get("admin1") or ""
+    fields = [
+        ("温度", "temperature_2m"),
+        ("体感温度", "apparent_temperature"),
+        ("湿度", "relative_humidity_2m"),
+        ("风速", "wind_speed_10m"),
+        ("风向", "wind_direction_10m"),
+        ("阵风", "wind_gusts_10m"),
+        ("降水", "precipitation"),
+        ("云量", "cloud_cover"),
+        ("气压", "pressure_msl"),
+    ]
+    details = []
+    for label, key in fields:
+        if key in current:
+            details.append(f"{label}：{current[key]}{units.get(key, '')}")
+    return (
+        f"实时天气地点：{name} {admin} {country}\n"
+        f"更新时间：{current.get('time', '未知')}\n"
+        + "\n".join(details)
+    )
+
+
+def _normalize_chat_result_v2(result: dict) -> dict:
+    reply = str(result.get("reply") or "").strip()
+    if not reply:
+        raise ValueError("reply 不能为空")
+    delta = int(result.get("affectionDelta", 0))
+    rule_override = bool(result.get("ruleOverride", False))
+    if not rule_override:
+        delta = max(-5, min(5, delta))
+    else:
+        delta = max(-500, min(500, delta))
+    return {
+        "reply": reply,
+        "affectionDelta": delta,
+        "affectionReason": str(result.get("affectionReason") or "").strip()[:1000],
+        "thinkingSummary": str(result.get("thinkingSummary") or "").strip()[:2000],
+        "weatherCity": str(result.get("weatherCity") or "").strip()[:100],
+    }
+
+
+def generate_chat_result(
+    text: str, character_id: str, model_key: str, user_id: str
+) -> dict:
+    runtime = resolve_model_runtime(model_key)
+    chat_ai = create_ai_client(runtime)
+    character = clawbot_store.character(character_id)
+    general = clawbot_store.general_snapshot(character_id)["config"]
+    time_aware = bool(general.get("timeAwareEnabled"))
+    weather_enabled = bool(general.get("weatherEnabled"))
+    base_prompt = clawbot_store.build_prompt(runtime["prompt"], character_id)
+    history = _history_for_ai(user_id, character_id, time_aware)
+    last_error = None
+    fallback_text = ""
+    weather_text = ""
+    for _attempt in range(2):
+        raw = chat_ai.chat(
+            text,
+            model=runtime["model"],
+            prompt=base_prompt + _chat_result_prompt_v2(
+                character, last_error, weather_text
+            ),
+            history=history,
+        )
+        fallback_text = str(raw or "").strip() or fallback_text
+        try:
+            result = _normalize_chat_result_v2(_extract_json(raw))
+            if weather_enabled and result["weatherCity"] and not weather_text:
+                try:
+                    weather_text = _weather_text(result["weatherCity"])
+                except Exception as weather_error:
+                    weather_text = f"天气查询失败：{weather_error}"
+                continue
+            if not weather_enabled:
+                result["weatherCity"] = ""
+            return result
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            last_error = str(error)
+    fallback_reply = fallback_text
+    try:
+        fallback_result = _extract_json(fallback_text)
+        if isinstance(fallback_result, dict) and fallback_result.get("reply"):
+            fallback_reply = str(fallback_result["reply"]).strip()
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return {
+        "reply": fallback_reply,
+        "affectionDelta": 0,
+        "affectionReason": "",
+        "thinkingSummary": "",
+        "weatherCity": "",
     }
 
 
@@ -827,6 +1027,18 @@ def generate_proactive_message(user_id, character_id):
     )
 
 
+def generate_proactive_message(user_id, character_id):
+    return generate_chat_result(
+        (
+            "请根据当前关系、人设、规则、记忆和最近聊天，自然主动开启一段对话。"
+            "回复要像真人临时想起对方时会说的话，不要提及定时、系统、任务、频率或主动消息设置。"
+        ),
+        character_id,
+        get_character_model_key(character_id),
+        user_id,
+    )
+
+
 async def send_proactive_message(
     session, to_id, context_token, text, bot_token_ref, bot_base_url_ref
 ):
@@ -890,7 +1102,7 @@ async def proactive_message_task(
                 continue
 
             loop = asyncio.get_running_loop()
-            reply = await loop.run_in_executor(
+            result = await loop.run_in_executor(
                 executor,
                 partial(
                     generate_proactive_message,
@@ -898,12 +1110,23 @@ async def proactive_message_task(
                     character_id,
                 ),
             )
-            reply = str(reply or "").strip()
+            reply = str(result.get("reply") or "").strip()
             if not reply:
                 raise ValueError("主动消息模型返回空内容")
             if clawbot_store.active_character()["id"] != character_id:
                 continue
             parts = split_reply_messages(reply)
+            general = clawbot_store.general_snapshot(character_id)["config"]
+            thinking_summary = result.get("thinkingSummary", "")
+            if thinking_summary and general.get("thinkingMode") == "wechat_and_web":
+                await send_msg_safe(
+                    session,
+                    last_contact["from_id"],
+                    last_contact["context_token"],
+                    f"思考摘要：{thinking_summary}",
+                    bot_token_ref,
+                    bot_base_url_ref,
+                )
             await send_reply_parts(
                 session,
                 last_contact["from_id"],
@@ -912,13 +1135,14 @@ async def proactive_message_task(
                 bot_token_ref,
                 bot_base_url_ref,
             )
-            for part in parts:
+            for index, part in enumerate(parts):
                 clawbot_store.add_message(
                     last_contact["from_id"],
                     "assistant",
                     part,
                     count_for_memory=False,
                     character_id=character_id,
+                    thinking_summary=thinking_summary if index == 0 else "",
                 )
             clawbot_store.mark_proactive_sent(
                 character_id, next_proactive_time(config, now), now
@@ -1305,7 +1529,24 @@ async def process_chat_batch(
     context_token = batch["context_token"]
     character_id = batch["character_id"]
     model_key = batch["model_key"]
-    text = "\n".join(batch["messages"])
+    raw_messages = [
+        item["text"] if isinstance(item, dict) else str(item)
+        for item in batch["messages"]
+    ]
+    stored_text = "\n".join(raw_messages)
+    general = clawbot_store.general_snapshot(character_id)["config"]
+    if general.get("timeAwareEnabled"):
+        text = "\n".join(
+            (
+                f"[北京时间 {_format_china_timestamp(item.get('received_at'))}] "
+                f"用户：{item.get('text', '')}"
+            )
+            if isinstance(item, dict)
+            else str(item)
+            for item in batch["messages"]
+        )
+    else:
+        text = stored_text
     typing_ticket = ""
     try:
         if from_id not in typing_ticket_cache:
@@ -1350,6 +1591,16 @@ async def process_chat_batch(
         parts = split_reply_messages(result["reply"])
         if not parts:
             raise ValueError("AI returned an empty reply")
+        thinking_summary = result.get("thinkingSummary", "")
+        if thinking_summary and general.get("thinkingMode") == "wechat_and_web":
+            await send_msg_safe(
+                session,
+                from_id,
+                context_token,
+                f"思考摘要：{thinking_summary}",
+                bot_token_ref,
+                bot_base_url_ref,
+            )
         await send_reply_parts(
             session,
             from_id,
@@ -1360,11 +1611,15 @@ async def process_chat_batch(
         )
 
         clawbot_store.add_message(
-            from_id, "user", text, character_id=character_id
+            from_id, "user", stored_text, character_id=character_id
         )
-        for part in parts:
+        for index, part in enumerate(parts):
             clawbot_store.add_message(
-                from_id, "assistant", part, character_id=character_id
+                from_id,
+                "assistant",
+                part,
+                character_id=character_id,
+                thinking_summary=thinking_summary if index == 0 else "",
             )
         try:
             clawbot_store.apply_affection_delta(
@@ -1426,7 +1681,9 @@ def enqueue_chat_message(
         character_id = clawbot_store.active_character()["id"]
         state["character_id"] = character_id
         state["model_key"] = get_character_model_key(character_id)
-    state["messages"].append(text)
+    state["messages"].append(
+        {"text": text, "received_at": datetime.now(timezone.utc).isoformat()}
+    )
     state["context_token"] = context_token
     if state["timer"] and not state["timer"].done():
         state["timer"].cancel()

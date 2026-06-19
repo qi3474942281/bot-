@@ -66,7 +66,11 @@ DEFAULT_PROACTIVE_PROGRESS = {
 DEFAULT_GENERAL_CONFIG = {
     "mergeWaitSeconds": 6,
     "currentModel": "",
+    "timeAwareEnabled": False,
+    "weatherEnabled": False,
+    "thinkingMode": "off",
 }
+THINKING_MODES = {"off", "web_only", "wechat_and_web"}
 
 
 class VersionConflict(ValueError):
@@ -135,11 +139,17 @@ def _normalize_proactive_progress(value) -> dict:
 
 def _normalize_general_config(value) -> dict:
     raw = value if isinstance(value, dict) else {}
+    thinking_mode = _clean_text(raw.get("thinkingMode"), 40)
+    if thinking_mode not in THINKING_MODES:
+        thinking_mode = DEFAULT_GENERAL_CONFIG["thinkingMode"]
     return {
         "mergeWaitSeconds": _int_setting(
             raw.get("mergeWaitSeconds"), 6, 1, 30
         ),
         "currentModel": _clean_text(raw.get("currentModel"), 100),
+        "timeAwareEnabled": bool(raw.get("timeAwareEnabled", False)),
+        "weatherEnabled": bool(raw.get("weatherEnabled", False)),
+        "thinkingMode": thinking_mode,
     }
 
 
@@ -305,6 +315,7 @@ class ClawBotStore:
                     user_id TEXT NOT NULL,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
+                    thinking_summary TEXT NOT NULL DEFAULT '',
                     count_for_memory INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL
                 );
@@ -368,6 +379,10 @@ class ClawBotStore:
             if "count_for_memory" not in message_columns:
                 connection.execute(
                     "ALTER TABLE messages ADD COLUMN count_for_memory INTEGER NOT NULL DEFAULT 1"
+                )
+            if "thinking_summary" not in message_columns:
+                connection.execute(
+                    "ALTER TABLE messages ADD COLUMN thinking_summary TEXT NOT NULL DEFAULT ''"
                 )
             existing = connection.execute(
                 "SELECT 1 FROM settings WHERE key = 'state'"
@@ -970,6 +985,42 @@ class ClawBotStore:
             self._renumber_entries(connection, character_id)
             self._bump_version(connection, character_id)
 
+    def clear_memory(self, character_id, expected_version=None) -> dict:
+        with self.lock, self._connect() as connection:
+            self._assert_version(connection, character_id, expected_version)
+            row, config, _progress = self._profile(connection, character_id)
+            progress = dict(DEFAULT_MEMORY_PROGRESS)
+            latest_id = self._latest_message_id(connection, character_id)
+            progress["factCheckpoint"] = latest_id
+            progress["stmCheckpoint"] = latest_id
+            progress["lastRoundMessageId"] = latest_id
+            connection.execute(
+                "DELETE FROM memory_entries WHERE character_id = ?",
+                (character_id,),
+            )
+            connection.execute(
+                """
+                UPDATE memory_profiles
+                SET progress_json = ?, version = version + 1, updated_at = ?
+                WHERE character_id = ?
+                """,
+                (
+                    json.dumps(progress, ensure_ascii=False),
+                    datetime.now(timezone.utc).isoformat(),
+                    character_id,
+                ),
+            )
+        return self.memory_snapshot(character_id)
+
+    def delete_message(self, message_id):
+        with self.lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM messages WHERE id = ?",
+                (int(message_id),),
+            )
+            if not cursor.rowcount:
+                raise ValueError("message not found")
+
     def _renumber_entries(self, connection, character_id):
         for kind in ("stm", "ltm"):
             rows = connection.execute(
@@ -1049,6 +1100,7 @@ class ClawBotStore:
         content: str,
         count_for_memory: bool = True,
         character_id: str | None = None,
+        thinking_summary: str = "",
     ):
         character = (
             self.character(character_id) if character_id else self.active_character()
@@ -1058,14 +1110,16 @@ class ClawBotStore:
             cursor = connection.execute(
                 """
                 INSERT INTO messages(
-                    character_id, user_id, role, content, count_for_memory, created_at
-                ) VALUES(?, ?, ?, ?, ?, ?)
+                    character_id, user_id, role, content, thinking_summary,
+                    count_for_memory, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     character["id"],
                     _clean_text(user_id, 200),
                     role,
                     _clean_text(content, 20000),
+                    _clean_text(thinking_summary, 2000),
                     1 if count_for_memory else 0,
                     now,
                 ),
@@ -1081,7 +1135,11 @@ class ClawBotStore:
         return cursor.lastrowid
 
     def recent_history(
-        self, user_id: str, limit: int = 20, character_id: str | None = None
+        self,
+        user_id: str,
+        limit: int = 20,
+        character_id: str | None = None,
+        include_timestamps: bool = False,
     ) -> list[dict]:
         character = (
             self.character(character_id) if character_id else self.active_character()
@@ -1089,19 +1147,26 @@ class ClawBotStore:
         with self.lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT role, content FROM messages
+                SELECT role, content, created_at FROM messages
                 WHERE character_id = ? AND user_id = ?
                 ORDER BY id DESC LIMIT ?
                 """,
                 (character["id"], user_id, max(1, min(limit, 100))),
             ).fetchall()
-        return [{"role": row["role"], "content": row["content"]} for row in reversed(rows)]
+        result = []
+        for row in reversed(rows):
+            item = {"role": row["role"], "content": row["content"]}
+            if include_timestamps:
+                item["created_at"] = row["created_at"]
+            result.append(item)
+        return result
 
     def history_for_web(self, limit: int = 300) -> list[dict]:
         with self.lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, character_id, user_id, role, content, created_at
+                SELECT id, character_id, user_id, role, content,
+                       thinking_summary, created_at
                 FROM messages ORDER BY id DESC LIMIT ?
                 """,
                 (max(1, min(limit, 1000)),),
@@ -1533,6 +1598,29 @@ def create_api_app(store: ClawBotStore, config: dict, model_loader=None) -> web.
         except (ValueError, TypeError) as error:
             return web.json_response({"error": str(error)}, status=400)
 
+    async def clear_memory(request):
+        try:
+            body = await request.json()
+            result = store.clear_memory(
+                request.match_info["character_id"],
+                body.get("version"),
+            )
+            result["models"] = model_loader() if model_loader else {}
+            return web.json_response(result)
+        except VersionConflict as error:
+            return web.json_response({"error": str(error)}, status=409)
+        except (json.JSONDecodeError, ValueError, TypeError) as error:
+            return web.json_response({"error": str(error)}, status=400)
+
+    async def delete_message(request):
+        try:
+            store.delete_message(request.match_info["message_id"])
+            return web.json_response(
+                {"ok": True, "history": store.history_for_web()}
+            )
+        except (ValueError, TypeError) as error:
+            return web.json_response({"error": str(error)}, status=400)
+
     async def get_proactive(request):
         try:
             return web.json_response(
@@ -1614,6 +1702,8 @@ def create_api_app(store: ClawBotStore, config: dict, model_loader=None) -> web.
     app.router.add_delete(
         "/api/memory/{character_id}/entries/{entry_id}", delete_memory_entry
     )
+    app.router.add_post("/api/memory/{character_id}/clear", clear_memory)
+    app.router.add_delete("/api/messages/{message_id}", delete_message)
     app.router.add_get("/api/proactive/{character_id}", get_proactive)
     app.router.add_put("/api/proactive/{character_id}", put_proactive)
     app.router.add_get("/api/general/{character_id}", get_general)

@@ -400,12 +400,23 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         }
         snapshot = self.store.general_snapshot("default")
         config = dict(snapshot["config"])
-        config.update({"mergeWaitSeconds": 9, "currentModel": "smart"})
+        config.update(
+            {
+                "mergeWaitSeconds": 9,
+                "currentModel": "smart",
+                "timeAwareEnabled": True,
+                "weatherEnabled": True,
+                "thinkingMode": "web_only",
+            }
+        )
         updated = self.store.save_general_config(
             "default", config, snapshot["version"], models
         )
         self.assertEqual(updated["config"]["mergeWaitSeconds"], 9)
         self.assertEqual(updated["config"]["currentModel"], "smart")
+        self.assertTrue(updated["config"]["timeAwareEnabled"])
+        self.assertTrue(updated["config"]["weatherEnabled"])
+        self.assertEqual(updated["config"]["thinkingMode"], "web_only")
         with self.assertRaises(ValueError):
             self.store.save_general_config(
                 "default", config, snapshot["version"], models
@@ -431,11 +442,59 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 "config": {
                     "mergeWaitSeconds": 7,
                     "currentModel": "fast",
+                    "timeAwareEnabled": True,
+                    "weatherEnabled": False,
+                    "thinkingMode": "wechat_and_web",
                 },
                 "version": payload["version"],
             },
         )
         self.assertEqual(response.status, 200)
+
+    async def test_clear_memory_and_delete_message_api(self):
+        snapshot = self.store.memory_snapshot("default")
+        fact = self.store.add_memory_entry(
+            "default",
+            {"kind": "fact", "content": "用户手动记住的事", "source": "user"},
+            snapshot["version"],
+        )
+        current = self.store.memory_snapshot("default")
+        self.store.add_memory_entry(
+            "default",
+            {"kind": "stm", "content": "短期记忆", "source": "user"},
+            current["version"],
+        )
+        user_id = "user-1"
+        first_id = self.store.add_message(
+            user_id, "user", "你好", thinking_summary="不会用于用户消息"
+        )
+        second_id = self.store.add_message(
+            user_id, "assistant", "你好呀", thinking_summary="简短思考摘要"
+        )
+
+        response = await self.client.post(
+            "/api/memory/default/clear",
+            headers=self.headers,
+            json={"version": self.store.memory_snapshot("default")["version"]},
+        )
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertEqual(payload["facts"], [])
+        self.assertEqual(payload["stm"], [])
+        self.assertEqual(payload["ltm"], [])
+        self.assertEqual(payload["progress"]["factRounds"], 0)
+
+        history = self.store.history_for_web()
+        assistant = next(item for item in history if item["id"] == second_id)
+        self.assertEqual(assistant["thinking_summary"], "简短思考摘要")
+
+        response = await self.client.delete(
+            f"/api/messages/{first_id}", headers=self.headers
+        )
+        self.assertEqual(response.status, 200)
+        remaining_ids = {item["id"] for item in (await response.json())["history"]}
+        self.assertNotIn(first_id, remaining_ids)
+        self.assertIn(second_id, remaining_ids)
 
     async def test_affection_manual_save_delta_limits_and_recent_history(self):
         snapshot = self.store.affection_snapshot("default")

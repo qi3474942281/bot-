@@ -49,6 +49,10 @@
     .history-row.user .history-meta { text-align: right; }
     .history-bubble { padding: 12px 16px; border: 1px solid #dbe3ee; border-radius: 6px 18px 18px 18px; background: #fff; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: 0 1px 2px rgba(15, 23, 42, .04); }
     .history-row.user .history-bubble { border-color: #0f172a; border-radius: 18px 6px 18px 18px; color: #fff; background: #0f172a; }
+    .history-message { position: relative; }
+    .history-delete { position: absolute; top: 22px; right: -10px; width: 22px; height: 22px; border: 0; border-radius: 999px; color: #fff; background: #ef4444; line-height: 20px; }
+    .history-row.user .history-delete { left: -10px; right: auto; }
+    .thinking-summary { margin: 0 4px 6px; padding: 8px 10px; border-radius: 10px; color: #475569; background: #e0f2fe; font-size: 12px; line-height: 1.5; }
     .memory-layout { display: grid; grid-template-columns: 210px minmax(0, 1fr); min-height: 520px; overflow: hidden; border: 1px solid #e2e8f0; border-radius: 18px; }
     .memory-nav { padding: 14px; border-right: 1px solid #e2e8f0; background: #f8fafc; }
     .memory-nav-button { display: block; width: 100%; margin-bottom: 8px; padding: 14px; border: 0; border-radius: 13px; color: #475569; background: transparent; text-align: left; }
@@ -390,6 +394,16 @@
             <label for="mergeWaitSeconds">连续消息合并等待（秒）</label>
             <input id="mergeWaitSeconds" type="number" min="1" max="30" value="${general.mergeWaitSeconds}">
           </div>
+          <div class="setting-card switch-row"><label for="timeAwareEnabled">时间感知</label><input id="timeAwareEnabled" type="checkbox" ${general.timeAwareEnabled ? "checked" : ""}></div>
+          <div class="setting-card switch-row"><label for="weatherEnabled">实时天气查询</label><input id="weatherEnabled" type="checkbox" ${general.weatherEnabled ? "checked" : ""}></div>
+          <div class="setting-card">
+            <label for="thinkingMode">思考摘要显示</label>
+            <select id="thinkingMode">
+              <option value="off" ${general.thinkingMode === "off" ? "selected" : ""}>关闭</option>
+              <option value="web_only" ${general.thinkingMode === "web_only" ? "selected" : ""}>仅网页显示</option>
+              <option value="wechat_and_web" ${general.thinkingMode === "wechat_and_web" ? "selected" : ""}>微信和网页显示</option>
+            </select>
+          </div>
           <div class="setting-card switch-row"><label for="proactiveEnabled">主动消息</label><input id="proactiveEnabled" type="checkbox" ${config.enabled ? "checked" : ""}></div>
           <div class="setting-card">
             <label for="proactiveMode">主动消息频率</label>
@@ -409,6 +423,7 @@
           <div class="setting-card"><label for="windowEnd">允许发送结束时间</label><input id="windowEnd" type="time" value="${escapeHtml(config.windowEnd)}"></div>
         </div>
         <button class="save" id="saveGeneralSettings">保存通用设置</button>
+        <button class="save" id="clearMemory" style="background:#dc2626">清空当前人物记忆</button>
       `;
       const mode = document.getElementById("proactiveMode");
       const exact = document.getElementById("exactMinutes");
@@ -418,13 +433,19 @@
       document.getElementById("saveGeneralSettings").addEventListener(
         "click", () => saveGeneralSettings().catch(handleGeneralError)
       );
+      document.getElementById("clearMemory").addEventListener(
+        "click", () => clearCurrentMemory().catch(handleMemoryError)
+      );
     }
 
     async function saveGeneralSettings() {
       const generalConfig = {
         ...generalData.config,
         currentModel: document.getElementById("chatModel").value,
-        mergeWaitSeconds: Number(document.getElementById("mergeWaitSeconds").value)
+        mergeWaitSeconds: Number(document.getElementById("mergeWaitSeconds").value),
+        timeAwareEnabled: document.getElementById("timeAwareEnabled").checked,
+        weatherEnabled: document.getElementById("weatherEnabled").checked,
+        thinkingMode: document.getElementById("thinkingMode").value
       };
       const config = {
         ...proactiveData.config,
@@ -453,6 +474,19 @@
         await loadGeneral();
         renderGeneralSettings();
       }
+    }
+
+    async function clearCurrentMemory() {
+      const character = activeCharacter();
+      if (!character || !memoryData) return;
+      if (!confirm(`确认清空「${character.name}」的全部记忆？\n会删除记住的事、STM、LTM 和记忆轮次进度，但保留必须遵守的规则。`)) return;
+      if (!confirm("再次确认：清空后不能从页面恢复。确定继续吗？")) return;
+      memoryData = await api(`/api/memory/${encodeURIComponent(character.id)}/clear`, {
+        method: "POST",
+        body: JSON.stringify({ version: memoryData.version })
+      });
+      renderMemories();
+      setStatus("当前人物记忆已清空，必须遵守的规则已保留。", "ok");
     }
 
     function memoryRows(values, type) {
@@ -685,6 +719,9 @@
           renderHistory();
         });
       });
+      elements.historyList.querySelectorAll(".history-delete").forEach(button => {
+        button.addEventListener("click", () => deleteHistoryMessage(Number(button.dataset.messageId)).catch(error => setStatus(error.message, "error")));
+      });
     }
 
     function historyDateParts(value) {
@@ -727,12 +764,23 @@
           return `
             <div class="history-row ${isUser ? "user" : "assistant"}">
               <div class="history-message">
+                <button class="history-delete" title="删除这条聊天记录" data-message-id="${item.id}">−</button>
                 <div class="history-meta">${isUser ? "用户" : "ClawBot"} · ${escapeHtml(item.date.time)}</div>
+                ${item.thinking_summary ? `<div class="thinking-summary">思考摘要：${escapeHtml(item.thinking_summary)}</div>` : ""}
                 <div class="history-bubble">${escapeHtml(item.content)}</div>
               </div>
             </div>
           `;
         }).join("");
+    }
+
+    async function deleteHistoryMessage(messageId) {
+      if (!messageId) return;
+      if (!confirm("删除这条聊天记录？")) return;
+      const result = await api(`/api/messages/${messageId}`, { method: "DELETE" });
+      history = result.history || [];
+      renderHistory();
+      setStatus("聊天记录已删除。", "ok");
     }
 
     async function addCharacter() {
