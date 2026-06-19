@@ -404,7 +404,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             {
                 "mergeWaitSeconds": 9,
                 "currentModel": "smart",
-                "splitReplyEnabled": False,
+                "replySplitMode": "sentence",
                 "timeAwareEnabled": True,
                 "weatherEnabled": True,
                 "thinkingMode": "web_only",
@@ -415,19 +415,26 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(updated["config"]["mergeWaitSeconds"], 9)
         self.assertEqual(updated["config"]["currentModel"], "smart")
-        self.assertFalse(updated["config"]["splitReplyEnabled"])
+        self.assertEqual(updated["config"]["replySplitMode"], "sentence")
         self.assertTrue(updated["config"]["timeAwareEnabled"])
         self.assertTrue(updated["config"]["weatherEnabled"])
         self.assertEqual(updated["config"]["thinkingMode"], "web_only")
+        legacy = self.store.save_general_config(
+            "default",
+            {**config, "replySplitMode": "", "splitReplyEnabled": False},
+            updated["version"],
+            models,
+        )
+        self.assertEqual(legacy["config"]["replySplitMode"], "single")
         with self.assertRaises(ValueError):
             self.store.save_general_config(
-                "default", config, snapshot["version"], models
+                "default", config, updated["version"], models
             )
         with self.assertRaises(ValueError):
             self.store.save_general_config(
                 "default",
                 {**config, "currentModel": "missing"},
-                updated["version"],
+                legacy["version"],
                 models,
             )
 
@@ -444,7 +451,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 "config": {
                     "mergeWaitSeconds": 7,
                     "currentModel": "fast",
-                    "splitReplyEnabled": True,
+                    "replySplitMode": "smart",
                     "timeAwareEnabled": True,
                     "weatherEnabled": False,
                     "thinkingMode": "wechat_and_web",

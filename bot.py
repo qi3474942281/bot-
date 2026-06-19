@@ -282,18 +282,42 @@ def _extract_json(text):
     return result
 
 
-def split_reply_messages(text: str) -> list[str]:
+def clean_reply_text(text: str) -> str:
     value = str(text or "").strip()
+    if not value:
+        return ""
+    patterns = [
+        r"^\s*\[?\s*北京时间\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s*\]?\s*(?:ClawBot|助手|AI)?\s*[：:]\s*",
+        r"^\s*\[?\s*北京时间\s+\d{4}[/-]\d{1,2}[/-]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?\s*\]?\s*(?:ClawBot|助手|AI)?\s*[：:]\s*",
+    ]
+    for pattern in patterns:
+        value = re.sub(pattern, "", value, count=1, flags=re.I)
+    return value.strip()
+
+
+def _reply_units(value: str) -> list[str]:
+    tokens = re.split(
+        r"(```[\s\S]*?```|https?://\S+|[^\n。！？!?；;]+[。！？!?；;]?|\n+)",
+        value,
+    )
+    return [item.strip() for item in tokens if item and item.strip()]
+
+
+def split_reply_by_sentence(text: str) -> list[str]:
+    value = clean_reply_text(text)
+    if not value:
+        return []
+    return _reply_units(value)
+
+
+def split_reply_messages(text: str) -> list[str]:
+    value = clean_reply_text(text)
     if not value:
         return []
     if len(value) <= 50:
         return [value]
 
-    tokens = re.split(
-        r"(```[\s\S]*?```|https?://\S+|[^\n。！？!?；;]+[。！？!?；;]?|\n+)",
-        value,
-    )
-    units = [item.strip() for item in tokens if item and item.strip()]
+    units = _reply_units(value)
     target = 60 if len(value) <= 120 else 85
     parts = []
     current = ""
@@ -326,10 +350,17 @@ def split_reply_messages(text: str) -> list[str]:
 
 
 def reply_parts_for_config(text: str, general: dict) -> list[str]:
-    value = str(text or "").strip()
+    value = clean_reply_text(text)
     if not value:
         return []
-    if general.get("splitReplyEnabled", True):
+    mode = general.get("replySplitMode")
+    if mode not in {"single", "sentence", "smart"}:
+        mode = "single" if general.get("splitReplyEnabled") is False else "smart"
+    if mode == "single":
+        return [value]
+    if mode == "sentence":
+        return split_reply_by_sentence(value)
+    if mode == "smart":
         return split_reply_messages(value)
     return [value]
 
@@ -428,6 +459,7 @@ def _chat_result_prompt_v2(character: dict, repair_error=None, weather_text="") 
         '"affectionReason":"简短原因","ruleOverride":true或false,'
         '"thinkingSummary":"简短思考摘要","weatherCity":"需要查询天气的城市或空字符串"}。\n'
         "reply 必须符合人物设定，可以包含多句和自然分段。\n"
+        "如果上下文里出现 [北京时间 ...] 这类时间标记，只能用于理解消息时间，reply 里不要复述、引用或加上任何时间戳前缀。\n"
         "thinkingSummary 只能是简短、安全的回应思路摘要，不要输出逐步推理链或隐藏推理过程。\n"
         "只有用户明确询问实时天气、温度、湿度、风力等天气信息时，weatherCity 才填写城市名，否则填空字符串。\n"
         "无明确好感度数值规则时，affectionDelta 必须在 -5 到 5 之间；"

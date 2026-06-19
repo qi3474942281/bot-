@@ -396,7 +396,14 @@
             <label for="mergeWaitSeconds">连续消息合并等待（秒）</label>
             <input id="mergeWaitSeconds" type="number" min="1" max="30" value="${general.mergeWaitSeconds}">
           </div>
-          <div class="setting-card switch-row"><label for="splitReplyEnabled">多气泡/分段回复</label><input id="splitReplyEnabled" type="checkbox" ${general.splitReplyEnabled !== false ? "checked" : ""}>
+          <div class="setting-card">
+            <label for="replySplitMode">回复发送模式</label>
+            <select id="replySplitMode">
+              <option value="single" ${general.replySplitMode === "single" ? "selected" : ""}>整段一条</option>
+              <option value="sentence" ${general.replySplitMode === "sentence" ? "selected" : ""}>按句分段</option>
+              <option value="smart" ${(!general.replySplitMode || general.replySplitMode === "smart") ? "selected" : ""}>智能多气泡（推荐）</option>
+            </select>
+            <small>控制 AI 回复在微信里是一整条发送，还是拆成多条气泡。</small>
           </div>
           <div class="setting-card switch-row"><label for="timeAwareEnabled">时间感知</label><input id="timeAwareEnabled" type="checkbox" ${general.timeAwareEnabled ? "checked" : ""}></div>
           <div class="setting-card switch-row"><label for="weatherEnabled">实时天气查询</label><input id="weatherEnabled" type="checkbox" ${general.weatherEnabled ? "checked" : ""}></div>
@@ -457,7 +464,7 @@
         ...generalData.config,
         currentModel: document.getElementById("chatModel").value,
         mergeWaitSeconds: Number(document.getElementById("mergeWaitSeconds").value),
-        splitReplyEnabled: document.getElementById("splitReplyEnabled").checked,
+        replySplitMode: document.getElementById("replySplitMode").value,
         timeAwareEnabled: document.getElementById("timeAwareEnabled").checked,
         weatherEnabled: document.getElementById("weatherEnabled").checked,
         thinkingMode: document.getElementById("thinkingMode").value

@@ -66,12 +66,13 @@ DEFAULT_PROACTIVE_PROGRESS = {
 DEFAULT_GENERAL_CONFIG = {
     "mergeWaitSeconds": 6,
     "currentModel": "",
-    "splitReplyEnabled": True,
+    "replySplitMode": "smart",
     "timeAwareEnabled": False,
     "weatherEnabled": False,
     "thinkingMode": "off",
 }
 THINKING_MODES = {"off", "web_only", "wechat_and_web"}
+REPLY_SPLIT_MODES = {"single", "sentence", "smart"}
 
 
 class VersionConflict(ValueError):
@@ -143,12 +144,19 @@ def _normalize_general_config(value) -> dict:
     thinking_mode = _clean_text(raw.get("thinkingMode"), 40)
     if thinking_mode not in THINKING_MODES:
         thinking_mode = DEFAULT_GENERAL_CONFIG["thinkingMode"]
+    reply_split_mode = _clean_text(raw.get("replySplitMode"), 40)
+    if reply_split_mode not in REPLY_SPLIT_MODES:
+        reply_split_mode = (
+            "single"
+            if raw.get("splitReplyEnabled") is False
+            else DEFAULT_GENERAL_CONFIG["replySplitMode"]
+        )
     return {
         "mergeWaitSeconds": _int_setting(
             raw.get("mergeWaitSeconds"), 6, 1, 30
         ),
         "currentModel": _clean_text(raw.get("currentModel"), 100),
-        "splitReplyEnabled": bool(raw.get("splitReplyEnabled", True)),
+        "replySplitMode": reply_split_mode,
         "timeAwareEnabled": bool(raw.get("timeAwareEnabled", False)),
         "weatherEnabled": bool(raw.get("weatherEnabled", False)),
         "thinkingMode": thinking_mode,
