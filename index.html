@@ -349,6 +349,24 @@
       return labels[config.mode] || labels.random_60_120;
     }
 
+    function proactiveStatusLabel(config, progress) {
+      if (!config.enabled) return "已关闭";
+      if (!progress.lastChatAt) return "等待首次聊天";
+      const idleUntil = progress.idleUntil ? new Date(progress.idleUntil) : null;
+      if (idleUntil && idleUntil.getTime() > Date.now()) return "等待聊天空闲";
+      return "已开启";
+    }
+
+    function proactiveNextLabel(config, progress) {
+      if (!config.enabled) return "未启用";
+      if (!progress.lastChatAt) return "等待首次聊天";
+      const idleUntil = progress.idleUntil ? new Date(progress.idleUntil) : null;
+      if (idleUntil && idleUntil.getTime() > Date.now()) {
+        return `空闲后开始计时：${formatChinaTime(progress.idleUntil)}`;
+      }
+      return progress.nextSendAt ? formatChinaTime(progress.nextSendAt) : "等待生成计划";
+    }
+
     function formatChinaTime(value) {
       if (!value) return "等待首次微信聊天";
       const date = new Date(value);
@@ -379,13 +397,13 @@
       elements.generalContent.className = "";
       elements.generalContent.innerHTML = `
         <div class="memory-section-header"><h3>通用设置</h3></div>
-        <p class="general-note">设置仅作用于“${escapeHtml(character.name)}”。只有当前选中的人物会发送主动消息；首次收到微信消息后才开始计时。</p>
+        <p class="general-note">设置仅作用于“${escapeHtml(character.name)}”。只有当前选中的人物会发送主动消息；聊天结束并连续 10 分钟无新消息后，才开始按频率计划主动消息。</p>
         ${progress.lastError ? `<div class="memory-error">最近错误：${escapeHtml(progress.lastError)}</div>` : ""}
         <div class="general-status">
-          <div class="stat-card">当前状态<strong>${config.enabled ? "已开启" : "已关闭"}</strong></div>
+          <div class="stat-card">当前状态<strong>${escapeHtml(proactiveStatusLabel(config, progress))}</strong></div>
           <div class="stat-card">当前频率<strong>${escapeHtml(proactiveModeLabel(config))}</strong></div>
           <div class="stat-card">允许时段<strong>${escapeHtml(config.windowStart)}–${escapeHtml(config.windowEnd)}</strong><small>北京时间</small></div>
-          <div class="stat-card">下次计划<strong>${config.enabled ? escapeHtml(formatChinaTime(progress.nextSendAt)) : "未启用"}</strong></div>
+          <div class="stat-card">下次计划<strong>${escapeHtml(proactiveNextLabel(config, progress))}</strong></div>
         </div>
         <div class="settings-grid">
           <div class="setting-card">

@@ -337,6 +337,8 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(updated["config"]["enabled"])
         self.assertEqual(updated["config"]["exactMinutes"], 15)
         self.assertEqual(updated["progress"]["nextSendAt"], "")
+        self.assertEqual(updated["progress"]["lastChatAt"], "")
+        self.assertEqual(updated["progress"]["idleUntil"], "")
 
         response = await self.client.put(
             "/api/proactive/default",
@@ -366,6 +368,23 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.store.memory_snapshot("default")["progress"]["factRounds"], 0
         )
+        chat_at = datetime(2026, 6, 14, 4, 5, tzinfo=timezone.utc)
+        snapshot = self.store.mark_proactive_chat("default", chat_at, 600)
+        self.assertEqual(snapshot["progress"]["nextSendAt"], "")
+        self.assertEqual(
+            snapshot["progress"]["lastChatAt"],
+            chat_at.isoformat(),
+        )
+        self.assertEqual(
+            snapshot["progress"]["idleUntil"],
+            datetime(2026, 6, 14, 4, 15, tzinfo=timezone.utc).isoformat(),
+        )
+        next_due = datetime(2026, 6, 14, 5, 0, tzinfo=timezone.utc)
+        snapshot = self.store.mark_proactive_sent(
+            "default", next_due, datetime(2026, 6, 14, 4, 30, tzinfo=timezone.utc)
+        )
+        self.assertEqual(snapshot["progress"]["nextSendAt"], next_due.isoformat())
+        self.assertEqual(snapshot["progress"]["lastChatAt"], chat_at.isoformat())
 
     async def test_proactive_china_time_window_including_overnight(self):
         daytime = {"windowStart": "08:00", "windowEnd": "23:00"}

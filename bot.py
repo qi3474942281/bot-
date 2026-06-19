@@ -1034,6 +1034,19 @@ PROACTIVE_INTERVALS = {
     "random_240_300": (240, 300),
     "random_1_300": (1, 300),
 }
+PROACTIVE_IDLE_SECONDS = 10 * 60
+
+
+def parse_utc_timestamp(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def next_proactive_time(config, now=None):
@@ -1121,20 +1134,48 @@ async def proactive_message_task(
                 continue
 
             now = datetime.now(timezone.utc)
-            next_send = None
-            if snapshot["progress"]["nextSendAt"]:
-                try:
-                    next_send = datetime.fromisoformat(
-                        snapshot["progress"]["nextSendAt"].replace("Z", "+00:00")
-                    ).astimezone(timezone.utc)
-                except ValueError:
-                    pass
+            recent_activity = last_contact.get("last_activity_at")
+            if isinstance(recent_activity, datetime):
+                recent_activity = recent_activity.astimezone(timezone.utc)
+                if now < recent_activity + timedelta(
+                    seconds=PROACTIVE_IDLE_SECONDS
+                ):
+                    clawbot_store.set_proactive_schedule(character_id, None)
+                    continue
+            progress = snapshot["progress"]
+            last_chat_at = parse_utc_timestamp(progress.get("lastChatAt"))
+            idle_until = parse_utc_timestamp(progress.get("idleUntil"))
+            if last_chat_at is None:
+                continue
+            expected_idle_until = last_chat_at + timedelta(
+                seconds=PROACTIVE_IDLE_SECONDS
+            )
+            if idle_until is None or idle_until < expected_idle_until:
+                idle_until = expected_idle_until
+                clawbot_store.set_proactive_schedule(character_id, None)
+            if now < idle_until:
+                continue
+
+            next_send = parse_utc_timestamp(progress.get("nextSendAt"))
             if next_send is None:
                 clawbot_store.set_proactive_schedule(
                     character_id, next_proactive_time(config, now)
                 )
                 continue
             if next_send > now:
+                continue
+            latest_snapshot = clawbot_store.proactive_snapshot(character_id)
+            latest_progress = latest_snapshot["progress"]
+            latest_last_chat = parse_utc_timestamp(
+                latest_progress.get("lastChatAt")
+            )
+            latest_idle_until = parse_utc_timestamp(
+                latest_progress.get("idleUntil")
+            )
+            if latest_last_chat and (
+                latest_idle_until is None or now < latest_idle_until
+            ):
+                clawbot_store.set_proactive_schedule(character_id, None)
                 continue
             if not proactive_allowed_at(now, config):
                 clawbot_store.set_proactive_schedule(
@@ -1663,6 +1704,14 @@ async def process_chat_batch(
                 thinking_summary=thinking_summary if index == 0 else "",
             )
         try:
+            clawbot_store.mark_proactive_chat(
+                character_id,
+                datetime.now(timezone.utc),
+                PROACTIVE_IDLE_SECONDS,
+            )
+        except Exception as error:
+            print(f"Failed to update proactive idle state: {error}")
+        try:
             clawbot_store.apply_affection_delta(
                 character_id,
                 result["affectionDelta"],
@@ -1778,7 +1827,7 @@ async def main():
         bot_base_url_ref = [bot_base_url]
         typing_ticket_cache = {}
         chat_buffers = {}
-        last_contact = {"from_id": "", "context_token": ""}
+        last_contact = {"from_id": "", "context_token": "", "last_activity_at": None}
         asyncio.create_task(
             proactive_message_task(
                 session, bot_token_ref, bot_base_url_ref, last_contact
@@ -1827,6 +1876,7 @@ async def main():
                     )
                     continue
 
+                last_contact["last_activity_at"] = datetime.now(timezone.utc)
                 enqueue_chat_message(
                     chat_buffers,
                     session,

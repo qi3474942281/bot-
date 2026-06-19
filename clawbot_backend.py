@@ -61,6 +61,8 @@ DEFAULT_PROACTIVE_CONFIG = {
 DEFAULT_PROACTIVE_PROGRESS = {
     "nextSendAt": "",
     "lastSentAt": "",
+    "lastChatAt": "",
+    "idleUntil": "",
     "lastError": "",
 }
 DEFAULT_GENERAL_CONFIG = {
@@ -135,6 +137,8 @@ def _normalize_proactive_progress(value) -> dict:
     return {
         "nextSendAt": _clean_text(raw.get("nextSendAt"), 80),
         "lastSentAt": _clean_text(raw.get("lastSentAt"), 80),
+        "lastChatAt": _clean_text(raw.get("lastChatAt"), 80),
+        "idleUntil": _clean_text(raw.get("idleUntil"), 80),
         "lastError": _clean_text(raw.get("lastError"), 1000),
     }
 
@@ -767,6 +771,31 @@ class ClawBotStore:
             )
         return self.proactive_snapshot(character_id)
 
+    def mark_proactive_chat(self, character_id, chat_at=None, idle_seconds=600):
+        chat_at = chat_at or datetime.now(timezone.utc)
+        idle_until = chat_at + timedelta(seconds=idle_seconds)
+        with self.lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT progress_json FROM proactive_profiles WHERE character_id = ?",
+                (character_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("character proactive profile not found")
+            progress = _normalize_proactive_progress(json.loads(row["progress_json"]))
+            progress["lastChatAt"] = chat_at.astimezone(timezone.utc).isoformat()
+            progress["idleUntil"] = idle_until.astimezone(timezone.utc).isoformat()
+            progress["nextSendAt"] = ""
+            progress["lastError"] = ""
+            connection.execute(
+                "UPDATE proactive_profiles SET progress_json = ?, updated_at = ? WHERE character_id = ?",
+                (
+                    json.dumps(progress, ensure_ascii=False),
+                    datetime.now(timezone.utc).isoformat(),
+                    character_id,
+                ),
+            )
+        return self.proactive_snapshot(character_id)
+
     def mark_proactive_sent(self, character_id, next_send_at, sent_at=None):
         sent_at = sent_at or datetime.now(timezone.utc)
         with self.lock, self._connect() as connection:
@@ -790,6 +819,7 @@ class ClawBotStore:
                     character_id,
                 ),
             )
+        return self.proactive_snapshot(character_id)
 
     def mark_proactive_error(self, character_id, message, retry_at):
         with self.lock, self._connect() as connection:
@@ -813,6 +843,9 @@ class ClawBotStore:
         now = now or datetime.now(timezone.utc)
         snapshot = self.proactive_snapshot(character_id)
         if not snapshot["config"]["enabled"]:
+            return False
+        idle_until = _parse_utc(snapshot["progress"]["idleUntil"])
+        if idle_until and now < idle_until:
             return False
         next_send = _parse_utc(snapshot["progress"]["nextSendAt"])
         return bool(next_send and next_send <= now)
