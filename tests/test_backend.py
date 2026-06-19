@@ -404,6 +404,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             {
                 "mergeWaitSeconds": 9,
                 "currentModel": "smart",
+                "splitReplyEnabled": False,
                 "timeAwareEnabled": True,
                 "weatherEnabled": True,
                 "thinkingMode": "web_only",
@@ -414,6 +415,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(updated["config"]["mergeWaitSeconds"], 9)
         self.assertEqual(updated["config"]["currentModel"], "smart")
+        self.assertFalse(updated["config"]["splitReplyEnabled"])
         self.assertTrue(updated["config"]["timeAwareEnabled"])
         self.assertTrue(updated["config"]["weatherEnabled"])
         self.assertEqual(updated["config"]["thinkingMode"], "web_only")
@@ -442,6 +444,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 "config": {
                     "mergeWaitSeconds": 7,
                     "currentModel": "fast",
+                    "splitReplyEnabled": True,
                     "timeAwareEnabled": True,
                     "weatherEnabled": False,
                     "thinkingMode": "wechat_and_web",
@@ -496,6 +499,13 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(first_id, remaining_ids)
         self.assertIn(second_id, remaining_ids)
 
+        response = await self.client.post(
+            "/api/messages/default/clear", headers=self.headers
+        )
+        self.assertEqual(response.status, 200)
+        remaining_ids = {item["id"] for item in (await response.json())["history"]}
+        self.assertNotIn(second_id, remaining_ids)
+
     async def test_affection_manual_save_delta_limits_and_recent_history(self):
         snapshot = self.store.affection_snapshot("default")
         self.assertEqual(snapshot["value"], 0)
@@ -529,6 +539,17 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status, 200)
         self.assertEqual((await response.json())["value"], 123)
+
+        payload = self.store.affection_snapshot("default")
+        response = await self.client.post(
+            "/api/affection/default/reset",
+            headers=self.headers,
+            json={"version": payload["version"]},
+        )
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertEqual(payload["value"], 0)
+        self.assertEqual(payload["history"], [])
 
     async def test_multiple_assistant_bubbles_count_as_one_memory_round(self):
         snapshot = self.store.memory_snapshot("default")

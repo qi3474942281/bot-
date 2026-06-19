@@ -80,6 +80,8 @@
     .general-note { margin: 0 0 18px; padding: 14px 16px; border-radius: 13px; color: #475569; background: #f1f5f9; line-height: 1.6; }
     .general-status { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
     .general-status .stat-card { min-height: 76px; }
+    .danger-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+    .danger-actions .save { margin: 0; background: #dc2626; }
     .affection-value { display: flex; align-items: baseline; gap: 8px; margin-bottom: 16px; }
     .affection-value strong { font-size: 42px; color: #0f172a; }
     .affection-progress { height: 14px; margin-bottom: 20px; overflow: hidden; border-radius: 999px; background: #e2e8f0; }
@@ -108,7 +110,7 @@
       .memory-nav { display: flex; gap: 8px; overflow-x: auto; border-right: 0; border-bottom: 1px solid #e2e8f0; }
       .memory-nav-button { flex: 0 0 142px; margin: 0; }
       .memory-content { padding: 16px; }
-      .settings-grid, .overview-stats, .general-status, .affection-controls { grid-template-columns: 1fr; }
+      .settings-grid, .overview-stats, .general-status, .affection-controls, .danger-actions { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -394,6 +396,8 @@
             <label for="mergeWaitSeconds">连续消息合并等待（秒）</label>
             <input id="mergeWaitSeconds" type="number" min="1" max="30" value="${general.mergeWaitSeconds}">
           </div>
+          <div class="setting-card switch-row"><label for="splitReplyEnabled">多气泡/分段回复</label><input id="splitReplyEnabled" type="checkbox" ${general.splitReplyEnabled !== false ? "checked" : ""}>
+          </div>
           <div class="setting-card switch-row"><label for="timeAwareEnabled">时间感知</label><input id="timeAwareEnabled" type="checkbox" ${general.timeAwareEnabled ? "checked" : ""}></div>
           <div class="setting-card switch-row"><label for="weatherEnabled">实时天气查询</label><input id="weatherEnabled" type="checkbox" ${general.weatherEnabled ? "checked" : ""}></div>
           <div class="setting-card">
@@ -423,7 +427,11 @@
           <div class="setting-card"><label for="windowEnd">允许发送结束时间</label><input id="windowEnd" type="time" value="${escapeHtml(config.windowEnd)}"></div>
         </div>
         <button class="save" id="saveGeneralSettings">保存通用设置</button>
-        <button class="save" id="clearMemory" style="background:#dc2626">清空当前人物记忆</button>
+        <div class="danger-actions">
+          <button class="save" id="clearMemory">清空记忆</button>
+          <button class="save" id="clearMessages">清空聊天记录</button>
+          <button class="save" id="resetAffection">重置好感度</button>
+        </div>
       `;
       const mode = document.getElementById("proactiveMode");
       const exact = document.getElementById("exactMinutes");
@@ -436,6 +444,12 @@
       document.getElementById("clearMemory").addEventListener(
         "click", () => clearCurrentMemory().catch(handleMemoryError)
       );
+      document.getElementById("clearMessages").addEventListener(
+        "click", () => clearCurrentMessages().catch(error => setStatus(error.message, "error"))
+      );
+      document.getElementById("resetAffection").addEventListener(
+        "click", () => resetCurrentAffection().catch(handleMemoryError)
+      );
     }
 
     async function saveGeneralSettings() {
@@ -443,6 +457,7 @@
         ...generalData.config,
         currentModel: document.getElementById("chatModel").value,
         mergeWaitSeconds: Number(document.getElementById("mergeWaitSeconds").value),
+        splitReplyEnabled: document.getElementById("splitReplyEnabled").checked,
         timeAwareEnabled: document.getElementById("timeAwareEnabled").checked,
         weatherEnabled: document.getElementById("weatherEnabled").checked,
         thinkingMode: document.getElementById("thinkingMode").value
@@ -487,6 +502,32 @@
       });
       renderMemories();
       setStatus("当前人物记忆已清空，必须遵守的规则已保留。", "ok");
+    }
+
+    async function clearCurrentMessages() {
+      const character = activeCharacter();
+      if (!character) return;
+      if (!confirm(`确认清空「${character.name}」的全部聊天记录？\n这不会清空记忆、好感度或人设。`)) return;
+      if (!confirm("再次确认：聊天记录清空后不能从页面恢复。确定继续吗？")) return;
+      const result = await api(`/api/messages/${encodeURIComponent(character.id)}/clear`, {
+        method: "POST"
+      });
+      history = result.history || [];
+      selectedHistoryDate = null;
+      renderHistory();
+      setStatus("当前人物聊天记录已清空。", "ok");
+    }
+
+    async function resetCurrentAffection() {
+      const character = activeCharacter();
+      if (!character || !affectionData) return;
+      if (!confirm(`确认把「${character.name}」的好感度重置为 0，并清空好感变化记录？`)) return;
+      affectionData = await api(`/api/affection/${encodeURIComponent(character.id)}/reset`, {
+        method: "POST",
+        body: JSON.stringify({ version: affectionData.version })
+      });
+      renderMemories();
+      setStatus("当前人物好感度已重置。", "ok");
     }
 
     function memoryRows(values, type) {

@@ -66,6 +66,7 @@ DEFAULT_PROACTIVE_PROGRESS = {
 DEFAULT_GENERAL_CONFIG = {
     "mergeWaitSeconds": 6,
     "currentModel": "",
+    "splitReplyEnabled": True,
     "timeAwareEnabled": False,
     "weatherEnabled": False,
     "thinkingMode": "off",
@@ -147,6 +148,7 @@ def _normalize_general_config(value) -> dict:
             raw.get("mergeWaitSeconds"), 6, 1, 30
         ),
         "currentModel": _clean_text(raw.get("currentModel"), 100),
+        "splitReplyEnabled": bool(raw.get("splitReplyEnabled", True)),
         "timeAwareEnabled": bool(raw.get("timeAwareEnabled", False)),
         "weatherEnabled": bool(raw.get("weatherEnabled", False)),
         "thinkingMode": thinking_mode,
@@ -1021,6 +1023,39 @@ class ClawBotStore:
             if not cursor.rowcount:
                 raise ValueError("message not found")
 
+    def clear_messages(self, character_id):
+        with self.lock, self._connect() as connection:
+            connection.execute(
+                "DELETE FROM messages WHERE character_id = ?",
+                (character_id,),
+            )
+        return self.history_for_web()
+
+    def reset_affection(self, character_id, expected_version=None) -> dict:
+        with self.lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT version FROM affection_profiles WHERE character_id = ?",
+                (character_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("character affection profile not found")
+            if expected_version is not None and int(expected_version) != row["version"]:
+                raise VersionConflict("好感度已更新，请刷新后重试")
+            now = datetime.now(timezone.utc).isoformat()
+            connection.execute(
+                """
+                UPDATE affection_profiles
+                SET value = 0, version = version + 1, updated_at = ?
+                WHERE character_id = ?
+                """,
+                (now, character_id),
+            )
+            connection.execute(
+                "DELETE FROM affection_history WHERE character_id = ?",
+                (character_id,),
+            )
+        return self.affection_snapshot(character_id)
+
     def _renumber_entries(self, connection, character_id):
         for kind in ("stm", "ltm"):
             rows = connection.execute(
@@ -1621,6 +1656,13 @@ def create_api_app(store: ClawBotStore, config: dict, model_loader=None) -> web.
         except (ValueError, TypeError) as error:
             return web.json_response({"error": str(error)}, status=400)
 
+    async def clear_messages(request):
+        try:
+            history = store.clear_messages(request.match_info["character_id"])
+            return web.json_response({"ok": True, "history": history})
+        except (ValueError, TypeError) as error:
+            return web.json_response({"error": str(error)}, status=400)
+
     async def get_proactive(request):
         try:
             return web.json_response(
@@ -1690,6 +1732,19 @@ def create_api_app(store: ClawBotStore, config: dict, model_loader=None) -> web.
         except (json.JSONDecodeError, ValueError, TypeError) as error:
             return web.json_response({"error": str(error)}, status=400)
 
+    async def reset_affection(request):
+        try:
+            body = await request.json()
+            result = store.reset_affection(
+                request.match_info["character_id"],
+                body.get("version"),
+            )
+            return web.json_response(result)
+        except VersionConflict as error:
+            return web.json_response({"error": str(error)}, status=409)
+        except (json.JSONDecodeError, ValueError, TypeError) as error:
+            return web.json_response({"error": str(error)}, status=400)
+
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/state", get_state)
     app.router.add_put("/api/state", put_state)
@@ -1704,12 +1759,14 @@ def create_api_app(store: ClawBotStore, config: dict, model_loader=None) -> web.
     )
     app.router.add_post("/api/memory/{character_id}/clear", clear_memory)
     app.router.add_delete("/api/messages/{message_id}", delete_message)
+    app.router.add_post("/api/messages/{character_id}/clear", clear_messages)
     app.router.add_get("/api/proactive/{character_id}", get_proactive)
     app.router.add_put("/api/proactive/{character_id}", put_proactive)
     app.router.add_get("/api/general/{character_id}", get_general)
     app.router.add_put("/api/general/{character_id}", put_general)
     app.router.add_get("/api/affection/{character_id}", get_affection)
     app.router.add_put("/api/affection/{character_id}", put_affection)
+    app.router.add_post("/api/affection/{character_id}/reset", reset_affection)
     return app
 
 

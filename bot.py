@@ -325,6 +325,15 @@ def split_reply_messages(text: str) -> list[str]:
     return [item for item in merged if item]
 
 
+def reply_parts_for_config(text: str, general: dict) -> list[str]:
+    value = str(text or "").strip()
+    if not value:
+        return []
+    if general.get("splitReplyEnabled", True):
+        return split_reply_messages(value)
+    return [value]
+
+
 def _chat_result_prompt(character: dict, repair_error=None) -> str:
     rules = "\n".join(f"- {item}" for item in character.get("promptMemories", []))
     repair = (
@@ -1115,8 +1124,8 @@ async def proactive_message_task(
                 raise ValueError("主动消息模型返回空内容")
             if clawbot_store.active_character()["id"] != character_id:
                 continue
-            parts = split_reply_messages(reply)
             general = clawbot_store.general_snapshot(character_id)["config"]
+            parts = reply_parts_for_config(reply, general)
             thinking_summary = result.get("thinkingSummary", "")
             if thinking_summary and general.get("thinkingMode") == "wechat_and_web":
                 await send_msg_safe(
@@ -1588,7 +1597,7 @@ async def process_chat_batch(
                 from_id,
             ),
         )
-        parts = split_reply_messages(result["reply"])
+        parts = reply_parts_for_config(result["reply"], general)
         if not parts:
             raise ValueError("AI returned an empty reply")
         thinking_summary = result.get("thinkingSummary", "")
